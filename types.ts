@@ -1,14 +1,10 @@
-export type Procedure<TArgs, TReturn, TProgress, TResume> = {};
+import type { Effect } from "effection";
 
-export type Invocation<TReturn, TProgress, TResume> = {};
+export interface WorkflowEffect extends Effect<unknown> {
+  workflowId: string;
+  effectId: string;
+}
 
-type Continuation<TReturn, TProgress, TResume> = {
-  done: true;
-  value: TReturn;
-} | {
-  done: false;
-  progress: TProgress;
-  resume: (
-    value: TResume,
-  ) => Operation<Continuation<TReturn, TProgress, TResume>>;
+export interface Workflow<T> {
+  [Symbol.iterator](): Iterator<WorkflowEffect, T, unknown>;
 };

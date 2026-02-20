@@ -1,1 +1,5 @@
-{}
+{
+  "imports": {
+    "effection": "jsr:@effection/effection@^4.0.2"
+  }
+}

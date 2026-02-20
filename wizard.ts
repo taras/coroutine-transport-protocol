@@ -1,6 +1,6 @@
 // server
 
-type Workflow<T> = Iterable<DurableEffect, T>;
+import { Workflow } from "./types.ts";
 
 function* serverLoop(): Workflow<never> {
   for (let connection of yield* each(connections)) {
