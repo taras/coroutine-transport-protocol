@@ -1,6 +1,13 @@
 {
   "imports": {
-    "effection": "../frontside/effection/mod.ts",
-    "effection/durable": "../frontside/effection/lib/durable/mod.ts"
+    "effection": "../../frontside/effection/mod.ts",
+    "effection/durable": "../../frontside/effection/lib/durable/mod.ts",
+    "@durable-streams/client": "npm:@durable-streams/client",
+    "@durable-streams/server": "npm:@durable-streams/server"
+  },
+  "tasks": {
+    "demo:server": "deno run --allow-all demo/server.ts",
+    "demo:run": "deno run --allow-all demo/pipeline.ts",
+    "demo:read": "npx @durable-streams/cli read durable-effection-demo"
   }
 }

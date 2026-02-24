@@ -1,0 +1,62 @@
+/**
+ * Durable Effection Demo — Multi-step Data Pipeline
+ *
+ * This workflow fetches data, processes each item with a delay,
+ * and aggregates the results. It has ~9 yield points (call + sleep effects),
+ * giving ample opportunity to interrupt mid-execution.
+ *
+ * Run 1 (recording):
+ *   deno task demo:run
+ *   # Ctrl+C after processing a few items
+ *
+ * Run 2 (replay + resume):
+ *   deno task demo:run
+ *   # Replayed steps complete instantly, then continues live
+ *
+ * Prerequisites:
+ *   deno task demo:server  (in another terminal)
+ *
+ * Usage:
+ *   deno task demo:run
+ */
+
+import { durableMain } from "../lib/durable-main.ts";
+import { sleep, call } from "effection";
+import type { Operation } from "effection";
+
+const STREAM_URL = "http://localhost:4437/durable-effection-demo";
+
+function* pipeline(): Operation<void> {
+  let start = Date.now();
+
+  console.log("\n--- Durable Pipeline Demo ---\n");
+
+  // Step 1: Fetch data (single call effect)
+  console.log("[Step 1] Fetching data...");
+  let data = yield* call(async () => {
+    return { items: ["alpha", "beta", "gamma", "delta"] };
+  });
+  console.log(`[Step 1] Got ${data.items.length} items\n`);
+
+  // Step 2: Process each item (sleep + call per item)
+  console.log("[Step 2] Processing items...");
+  let results: string[] = [];
+  for (let item of data.items) {
+    yield* sleep(2000); // 2s per item — gives time to Ctrl+C
+    let processed = yield* call(async () => item.toUpperCase());
+    results.push(processed);
+    let elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    console.log(`  [${elapsed}s] Processed: ${item} -> ${processed}`);
+  }
+
+  // Step 3: Aggregate results
+  console.log("\n[Step 3] Aggregating results...");
+  yield* sleep(1000);
+  let final = results.join(", ");
+
+  console.log(`\n=== Pipeline complete: ${final} ===`);
+  let totalTime = ((Date.now() - start) / 1000).toFixed(1);
+  console.log(`=== Total time: ${totalTime}s ===\n`);
+}
+
+await durableMain(STREAM_URL, () => pipeline());
