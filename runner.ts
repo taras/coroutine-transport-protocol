@@ -1,4 +1,4 @@
-import { run, Ok, Err, type Effect, type Operation, type Task, type Result } from "effection";
+import { run, Ok, Err, type Effect, type Operation, type Task, type Result, type Scope } from "effection";
 import type {
   DurableStream,
   Json,
@@ -11,7 +11,7 @@ import type {
 let nextId = 0;
 
 function genScopeId(): string {
-  return String(nextId++);
+  return `s${nextId++}`;
 }
 
 function genEffectId(): string {
@@ -51,13 +51,43 @@ function isJsonSafe(value: unknown): value is Json {
   return false;
 }
 
-function toJson(value: unknown): Json {
-  if (value === undefined) return null;
-  if (isJsonSafe(value)) return value;
-  return { __type: typeof value, __toString: String(value) } as Json;
+// ── Scope Ref Sentinel ─────────────────────────────────────────────
+//
+// When a Scope object is resolved (e.g., from useScope()), we write
+// a sentinel { __scopeRef: scopeId } into the stream. On replay,
+// the runner detects this sentinel and resolves with the real live
+// Scope object instead.
+
+interface ScopeRefSentinel {
+  __scopeRef: string;
 }
 
-// ── Replay Queue ───────────────────────────────────────────────────
+function isScopeRefSentinel(value: unknown): value is ScopeRefSentinel {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    "__scopeRef" in (value as Record<string, unknown>) &&
+    typeof (value as Record<string, unknown>).__scopeRef === "string"
+  );
+}
+
+// ── Durable Execution Context ──────────────────────────────────────
+//
+// Shared mutable state for a single durableRun invocation.
+// Tracks the stream, replay state, and scope-to-ID mappings.
+// Both the root and child scopes share this context.
+
+interface DurableContext {
+  stream: DurableStream;
+  streamComplete: boolean;
+  /** Map Effection Scope objects → durable scopeIds */
+  scopeIds: WeakMap<Scope, string>;
+  /** Per-scope replay queues: scopeId → ordered list of effect entries */
+  replayQueues: Map<string, ReplayEntry[]>;
+  /** Per-scope replay cursors: scopeId → current index */
+  replayCursors: Map<string, number>;
+}
 
 interface ReplayEntry {
   effectId: string;
@@ -65,9 +95,12 @@ interface ReplayEntry {
   result: Result<Json>;
 }
 
-function buildReplayQueue(entries: StreamEntry[]): ReplayEntry[] {
-  const queue: ReplayEntry[] = [];
+// ── Build replay state from stream ─────────────────────────────────
 
+function buildReplayQueues(entries: StreamEntry[]): Map<string, ReplayEntry[]> {
+  const queues = new Map<string, ReplayEntry[]>();
+
+  // Index resolutions by effectId
   const resolutions = new Map<string, Result<Json>>();
   for (const { event } of entries) {
     if (event.type === "effect:resolved") {
@@ -77,11 +110,15 @@ function buildReplayQueue(entries: StreamEntry[]): ReplayEntry[] {
     }
   }
 
+  // Walk effect:yielded events, pair with resolutions, group by scope
   for (const { event } of entries) {
     if (event.type === "effect:yielded") {
       const resolution = resolutions.get(event.effectId);
       if (resolution) {
-        queue.push({
+        if (!queues.has(event.scopeId)) {
+          queues.set(event.scopeId, []);
+        }
+        queues.get(event.scopeId)!.push({
           effectId: event.effectId,
           description: event.description,
           result: resolution,
@@ -90,19 +127,13 @@ function buildReplayQueue(entries: StreamEntry[]): ReplayEntry[] {
     }
   }
 
-  return queue;
+  return queues;
 }
 
-/** Check if the stream represents a completed execution.
- *  Complete means either:
- *  - workflow:return is present (successful completion), or
- *  - scope:destroyed with ok:false for the root scope (errored completion)
- */
 function isStreamComplete(entries: StreamEntry[]): boolean {
   if (entries.some(({ event }) => event.type === "workflow:return")) {
     return true;
   }
-  // Find the root scope (first scope:created without parentScopeId)
   let rootScopeId: string | undefined;
   for (const { event } of entries) {
     if (event.type === "scope:created" && !event.parentScopeId) {
@@ -135,176 +166,304 @@ export class DivergenceError extends Error {
   }
 }
 
+// ── toJson ─────────────────────────────────────────────────────────
+
+function toJson(value: unknown, ctx: DurableContext): Json {
+  if (value === undefined) return null;
+  // Check if this is a Scope object we're tracking
+  if (value !== null && typeof value === "object") {
+    const scopeId = ctx.scopeIds.get(value as Scope);
+    if (scopeId !== undefined) {
+      return { __scopeRef: scopeId };
+    }
+  }
+  if (isJsonSafe(value)) return value;
+  return { __type: typeof value, __toString: String(value) } as Json;
+}
+
+// ── Wrap Scope ─────────────────────────────────────────────────────
+//
+// Create a Proxy around a real Scope that intercepts scope.run()
+// to wrap child operations with durable instrumentation.
+
+function wrapScope(
+  realScope: Scope,
+  parentScopeId: string,
+  ctx: DurableContext,
+): Scope {
+  return new Proxy(realScope, {
+    get(target, prop, receiver) {
+      if (prop === "run") {
+        return <T>(childOp: () => Operation<T>): Task<T> => {
+          const childScopeId = genScopeId();
+
+          if (!ctx.streamComplete) {
+            ctx.stream.append({
+              type: "scope:created",
+              scopeId: childScopeId,
+              parentScopeId,
+            });
+          }
+
+          const wrappedChildOp = wrapOperation(childOp, childScopeId, ctx);
+          const task = target.run(wrappedChildOp);
+
+          return task;
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}
+
+// ── Wrap Operation ─────────────────────────────────────────────────
+//
+// Takes an operation and returns a new operation whose generator
+// iterator intercepts every Effect:
+//   - Replay phase: feed stored result via synthetic Effect
+//   - Live phase: wrap real Effect to record resolution to stream
+
+function wrapOperation<T>(
+  operation: () => Operation<T>,
+  scopeId: string,
+  ctx: DurableContext,
+): () => Operation<T> {
+  return (): Operation<T> => ({
+    [Symbol.iterator](): Iterator<Effect<unknown>, T, unknown> {
+      const iter = operation()[Symbol.iterator]();
+      const replayQueue = ctx.replayQueues.get(scopeId) ?? [];
+      if (!ctx.replayCursors.has(scopeId)) {
+        ctx.replayCursors.set(scopeId, 0);
+      }
+
+      return {
+        next(value?: unknown): IteratorResult<Effect<unknown>, T> {
+          let result: IteratorResult<Effect<unknown>, T>;
+          try {
+            result = iter.next(value);
+          } catch (e) {
+            if (!ctx.streamComplete) {
+              ctx.stream.append({
+                type: "scope:destroyed",
+                scopeId,
+                result: { ok: false, error: serializeError(e) },
+              });
+              // Only close the stream if this is the root scope failing
+              // (Child scope failures don't close the stream)
+            }
+            throw e;
+          }
+
+          if (result.done) {
+            if (!ctx.streamComplete) {
+              ctx.stream.append({
+                type: "workflow:return",
+                scopeId,
+                value: toJson(result.value, ctx),
+              });
+              ctx.stream.append({
+                type: "scope:destroyed",
+                scopeId,
+                result: { ok: true },
+              });
+            }
+            return result;
+          }
+
+          const effect = result.value;
+          const cursor = ctx.replayCursors.get(scopeId)!;
+
+          // ── Replay phase ──
+          if (cursor < replayQueue.length) {
+            const entry = replayQueue[cursor];
+
+            if (entry.description !== effect.description) {
+              throw new DivergenceError(cursor, entry.description, effect.description);
+            }
+
+            ctx.replayCursors.set(scopeId, cursor + 1);
+
+            const syntheticEffect: Effect<unknown> = {
+              description: effect.description,
+              enter(resolve, routine) {
+                // If the stored result is a scope ref sentinel,
+                // resolve with a wrapped real Scope from the routine
+                if (entry.result.ok) {
+                  const val = entry.result.value;
+                  if (val !== null && val !== undefined && isScopeRefSentinel(val as Json)) {
+                    const wrappedScope = wrapScope(routine.scope, scopeId, ctx);
+                    ctx.scopeIds.set(wrappedScope, scopeId);
+                    ctx.scopeIds.set(routine.scope, scopeId);
+                    resolve(Ok(wrappedScope));
+                    return (discarded) => discarded(Ok());
+                  }
+                }
+                resolve(entry.result);
+                return (discarded) => discarded(Ok());
+              },
+            };
+
+            return { done: false, value: syntheticEffect };
+          }
+
+          // ── Live phase ──
+          const effectId = genEffectId();
+          if (!ctx.streamComplete) {
+            ctx.stream.append({
+              type: "effect:yielded",
+              scopeId,
+              effectId,
+              description: effect.description,
+            });
+          }
+
+          const wrappedEffect: Effect<unknown> = {
+            description: effect.description,
+            enter(resolve, routine) {
+              const wrappedResolve: typeof resolve = (result) => {
+                if (!ctx.streamComplete) {
+                  if (result.ok) {
+                    // If this is a useScope() resolution, register the scope
+                    // and wrap it so child scope.run() calls are intercepted
+                    let valueToSerialize = result.value;
+                    if (
+                      effect.description === "useScope()" &&
+                      result.value !== null &&
+                      typeof result.value === "object"
+                    ) {
+                      const realScope = result.value as Scope;
+                      ctx.scopeIds.set(realScope, scopeId);
+                      const wrappedScope = wrapScope(realScope, scopeId, ctx);
+                      ctx.scopeIds.set(wrappedScope, scopeId);
+                      // Replace the result so the generator gets our wrapped Scope
+                      resolve(Ok(wrappedScope));
+                      ctx.stream.append({
+                        type: "effect:resolved",
+                        effectId,
+                        value: toJson(wrappedScope, ctx),
+                      });
+                      return;
+                    }
+                    ctx.stream.append({
+                      type: "effect:resolved",
+                      effectId,
+                      value: toJson(valueToSerialize, ctx),
+                    });
+                  } else {
+                    ctx.stream.append({
+                      type: "effect:errored",
+                      effectId,
+                      error: serializeError(result.error),
+                    });
+                  }
+                }
+                resolve(result);
+              };
+              return effect.enter(wrappedResolve, routine);
+            },
+          };
+
+          return { done: false, value: wrappedEffect };
+        },
+
+        return(value?: unknown): IteratorResult<Effect<unknown>, T> {
+          if (iter.return) {
+            return iter.return(value as T);
+          }
+          return { done: true, value: value as T };
+        },
+
+        throw(error?: unknown): IteratorResult<Effect<unknown>, T> {
+          if (iter.throw) {
+            try {
+              return iter.throw(error);
+            } catch (e) {
+              if (!ctx.streamComplete) {
+                ctx.stream.append({
+                  type: "scope:destroyed",
+                  scopeId,
+                  result: { ok: false, error: serializeError(e) },
+                });
+              }
+              throw e;
+            }
+          }
+          throw error;
+        },
+      };
+    },
+  });
+}
+
 // ── Durable Runner ─────────────────────────────────────────────────
-//
-// Executes an Effection operation while recording all effect
-// resolutions to a DurableStream.
-//
-// If the stream already contains events (from a previous execution),
-// stored effect results are replayed: the generator is fast-forwarded
-// through effects whose results are known, without calling enter().
-// Once stored events are exhausted, live execution continues and
-// new events are appended.
-//
-// If the stream is already complete (has workflow:return), the
-// entire execution is pure replay — no new events are written.
 
 export function durableRun<T>(
   stream: DurableStream,
   operation: () => Operation<T>,
 ): Task<T> {
   const existingEntries = stream.read();
-  const replayQueue = buildReplayQueue(existingEntries);
   const streamComplete = isStreamComplete(existingEntries);
-  let replayIndex = 0;
 
-  // Determine scopeId: reuse from stream or generate new
-  let scopeId: string | undefined;
+  const ctx: DurableContext = {
+    stream,
+    streamComplete,
+    scopeIds: new WeakMap(),
+    replayQueues: buildReplayQueues(existingEntries),
+    replayCursors: new Map(),
+  };
+
+  // Determine root scopeId: reuse from stream or generate new
+  let rootScopeId: string | undefined;
   for (const { event } of existingEntries) {
     if (event.type === "scope:created" && !event.parentScopeId) {
-      scopeId = event.scopeId;
+      rootScopeId = event.scopeId;
       break;
     }
   }
-  if (!scopeId) {
-    scopeId = genScopeId();
-    stream.append({ type: "scope:created", scopeId });
+  if (!rootScopeId) {
+    rootScopeId = genScopeId();
+    stream.append({ type: "scope:created", scopeId: rootScopeId });
   }
 
-  const rootScopeId = scopeId;
+  // Wrap the root operation and close the stream when done
+  const rootOp = wrapOperation(operation, rootScopeId, ctx);
 
-  const wrappedOperation = (): Operation<T> => {
-    return {
-      [Symbol.iterator](): Iterator<Effect<unknown>, T, unknown> {
-        const iter = operation()[Symbol.iterator]();
-
-        return {
-          next(value?: unknown): IteratorResult<Effect<unknown>, T> {
-            let result: IteratorResult<Effect<unknown>, T>;
-            try {
-              result = iter.next(value);
-            } catch (e) {
-              // Generator threw synchronously (e.g., throw before first yield)
-              if (!streamComplete) {
-                stream.append({
-                  type: "scope:destroyed",
-                  scopeId: rootScopeId,
-                  result: { ok: false, error: serializeError(e) },
-                });
-                stream.close();
-              }
-              throw e;
+  // Wrap again to handle stream closing (only for root scope)
+  const closingOp = (): Operation<T> => ({
+    [Symbol.iterator](): Iterator<Effect<unknown>, T, unknown> {
+      const iter = rootOp()[Symbol.iterator]();
+      return {
+        next(value?: unknown): IteratorResult<Effect<unknown>, T> {
+          let result: IteratorResult<Effect<unknown>, T>;
+          try {
+            result = iter.next(value);
+          } catch (e) {
+            if (!ctx.streamComplete && !stream.closed) {
+              stream.close();
             }
-
-            if (result.done) {
-              // Generator returned
-              if (!streamComplete) {
-                stream.append({
-                  type: "workflow:return",
-                  scopeId: rootScopeId,
-                  value: toJson(result.value),
-                });
-                stream.append({
-                  type: "scope:destroyed",
-                  scopeId: rootScopeId,
-                  result: { ok: true },
-                });
-                stream.close();
-              }
-              return result;
+            throw e;
+          }
+          if (result.done && !ctx.streamComplete) {
+            stream.close();
+          }
+          return result;
+        },
+        return(value?: unknown): IteratorResult<Effect<unknown>, T> {
+          return iter.return ? iter.return(value as T) : { done: true, value: value as T };
+        },
+        throw(error?: unknown): IteratorResult<Effect<unknown>, T> {
+          try {
+            return iter.throw ? iter.throw(error) : (() => { throw error; })();
+          } catch (e) {
+            if (!ctx.streamComplete && !stream.closed) {
+              stream.close();
             }
+            throw e;
+          }
+        },
+      };
+    },
+  });
 
-            const effect = result.value;
-
-            // ── Replay phase ──
-            if (replayIndex < replayQueue.length) {
-              const entry = replayQueue[replayIndex];
-
-              if (entry.description !== effect.description) {
-                throw new DivergenceError(
-                  replayIndex,
-                  entry.description,
-                  effect.description,
-                );
-              }
-
-              replayIndex++;
-
-              const syntheticEffect: Effect<unknown> = {
-                description: effect.description,
-                enter(resolve) {
-                  resolve(entry.result);
-                  return (discarded) => discarded(Ok());
-                },
-              };
-
-              return { done: false, value: syntheticEffect };
-            }
-
-            // ── Live phase ──
-            const effectId = genEffectId();
-            stream.append({
-              type: "effect:yielded",
-              scopeId: rootScopeId,
-              effectId,
-              description: effect.description,
-            });
-
-            const wrappedEffect: Effect<unknown> = {
-              description: effect.description,
-              enter(resolve, routine) {
-                const wrappedResolve: typeof resolve = (result) => {
-                  if (result.ok) {
-                    stream.append({
-                      type: "effect:resolved",
-                      effectId,
-                      value: toJson(result.value),
-                    });
-                  } else {
-                    stream.append({
-                      type: "effect:errored",
-                      effectId,
-                      error: serializeError(result.error),
-                    });
-                  }
-                  resolve(result);
-                };
-                return effect.enter(wrappedResolve, routine);
-              },
-            };
-
-            return { done: false, value: wrappedEffect };
-          },
-
-          return(value?: unknown): IteratorResult<Effect<unknown>, T> {
-            if (iter.return) {
-              return iter.return(value as T);
-            }
-            return { done: true, value: value as T };
-          },
-
-          throw(error?: unknown): IteratorResult<Effect<unknown>, T> {
-            if (iter.throw) {
-              try {
-                return iter.throw(error);
-              } catch (e) {
-                if (!streamComplete) {
-                  stream.append({
-                    type: "scope:destroyed",
-                    scopeId: rootScopeId,
-                    result: { ok: false, error: serializeError(e) },
-                  });
-                  stream.close();
-                }
-                throw e;
-              }
-            }
-            throw error;
-          },
-        };
-      },
-    };
-  };
-
-  return run(wrappedOperation);
+  return run(closingOp);
 }

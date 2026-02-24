@@ -4,7 +4,7 @@ import {
   assertRejects,
   assertThrows,
 } from "jsr:@std/assert";
-import { action, call, type Operation } from "effection";
+import { action, call, spawn, type Operation } from "effection";
 import { InMemoryDurableStream } from "./stream.ts";
 import { durableRun, resetIds, DivergenceError } from "./runner.ts";
 import type { DurableEvent } from "./types.ts";
@@ -538,4 +538,182 @@ Deno.test("resume replays stored effect error without entering effect", async ()
 
   // KEY: enter() must NOT have been called
   assertEquals(entered, false, "effect.enter() must not be called when replaying an errored effect");
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Test 5: Spawn — Parent and Child Interleaved
+// ═══════════════════════════════════════════════════════════════════
+//
+// When a workflow spawns a child, events from both parent and child
+// are interleaved in the same stream. Each event carries a scopeId
+// to distinguish which scope it belongs to. The child scope has a
+// parentScopeId linking back to the parent.
+
+Deno.test("spawn produces interleaved parent/child events in stream", async () => {
+  resetIds();
+  const stream = new InMemoryDurableStream();
+
+  const task = durableRun(stream, function* parent(): Operation<number> {
+    const child = yield* spawn(function* child() {
+      yield* action<void>((resolve) => {
+        resolve(undefined as never);
+        return () => {};
+      }, "child-work");
+      return 42;
+    });
+    return yield* child;
+  });
+
+  const result = await task;
+  assertEquals(result, 42);
+
+  const events = streamEvents(stream);
+
+  // Find root and child scope IDs from events
+  const rootCreated = expectEvent(events, 0, "scope:created");
+  const rootScopeId = rootCreated.scopeId;
+  assertEquals(rootCreated.parentScopeId, undefined, "root scope has no parent");
+
+  // Find the child scope:created event
+  const childCreatedIdx = events.findIndex(
+    (e) => e.type === "scope:created" && e.scopeId !== rootScopeId,
+  );
+  assertEquals(childCreatedIdx > 0, true, "child scope:created must exist after root");
+  const childCreated = expectEvent(events, childCreatedIdx, "scope:created");
+  const childScopeId = childCreated.scopeId;
+  assertEquals(childCreated.parentScopeId, rootScopeId, "child scope must reference parent");
+
+  // The useScope() effect must be in the root scope
+  const useScopeIdx = events.findIndex(
+    (e) => e.type === "effect:yielded" && e.description === "useScope()",
+  );
+  assertEquals(useScopeIdx > 0, true, "useScope() effect must exist");
+  const useScopeYielded = expectEvent(events, useScopeIdx, "effect:yielded");
+  assertEquals(useScopeYielded.scopeId, rootScopeId, "useScope() belongs to root scope");
+
+  // useScope() must resolve with a scope ref sentinel
+  const useScopeResolved = expectEvent(events, useScopeIdx + 1, "effect:resolved");
+  assertEquals(useScopeResolved.effectId, useScopeYielded.effectId);
+  assertEquals(
+    typeof (useScopeResolved.value as Record<string, unknown>)?.__scopeRef,
+    "string",
+    "useScope() must resolve with a __scopeRef sentinel",
+  );
+
+  // The child's work effect must carry the child's scopeId
+  const childWorkIdx = events.findIndex(
+    (e) => e.type === "effect:yielded" && e.description === "child-work",
+  );
+  assertEquals(childWorkIdx > 0, true, "child-work effect must exist");
+  const childWork = expectEvent(events, childWorkIdx, "effect:yielded");
+  assertEquals(childWork.scopeId, childScopeId, "child-work must belong to child scope");
+
+  // Child's resolution must reference the child's effect
+  const childWorkResolved = expectEvent(events, childWorkIdx + 1, "effect:resolved");
+  assertEquals(childWorkResolved.effectId, childWork.effectId);
+
+  // Child must have workflow:return with value 42
+  const childReturn = events.find(
+    (e) => e.type === "workflow:return" && e.scopeId === childScopeId,
+  );
+  assertExists(childReturn, "child workflow:return must exist");
+  if (childReturn.type === "workflow:return") {
+    assertEquals(childReturn.value, 42);
+  }
+
+  // Child must have scope:destroyed
+  const childDestroyed = events.find(
+    (e) => e.type === "scope:destroyed" && e.scopeId === childScopeId,
+  );
+  assertExists(childDestroyed, "child scope:destroyed must exist");
+  if (childDestroyed.type === "scope:destroyed") {
+    assertEquals(childDestroyed.result, { ok: true });
+  }
+
+  // Root must have workflow:return with value 42
+  const rootReturn = events.find(
+    (e) => e.type === "workflow:return" && e.scopeId === rootScopeId,
+  );
+  assertExists(rootReturn, "root workflow:return must exist");
+  if (rootReturn.type === "workflow:return") {
+    assertEquals(rootReturn.value, 42);
+  }
+
+  // Root must have scope:destroyed
+  const rootDestroyed = events.find(
+    (e) => e.type === "scope:destroyed" && e.scopeId === rootScopeId,
+  );
+  assertExists(rootDestroyed, "root scope:destroyed must exist");
+  if (rootDestroyed.type === "scope:destroyed") {
+    assertEquals(rootDestroyed.result, { ok: true });
+  }
+
+  // Verify all effect linkage is correct
+  assertEffectLinkage(events);
+
+  // Stream must be closed
+  assertEquals(stream.closed, true);
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Test 6: Spawn Resume — Child Scope Reconstructed
+// ═══════════════════════════════════════════════════════════════════
+//
+// Given a stream from a completed spawn execution, replay must:
+// 1. Replay the parent's useScope() without entering
+// 2. Create a real child scope (scope:created triggers scope.run wrapping)
+// 3. Replay the child's effects without entering
+// 4. Return the correct final value
+
+Deno.test("spawn resume replays child scope without entering effects", async () => {
+  resetIds();
+
+  // First: do a live run to capture the stream
+  const liveStream = new InMemoryDurableStream();
+  let liveChildEnterCount = 0;
+
+  await durableRun(liveStream, function* parent(): Operation<number> {
+    const child = yield* spawn(function* child() {
+      yield* action<void>((resolve) => {
+        liveChildEnterCount++;
+        resolve(undefined as never);
+        return () => {};
+      }, "child-work");
+      return 42;
+    });
+    return yield* child;
+  });
+
+  assertEquals(liveChildEnterCount, 1, "live run should enter child effect once");
+  assertEquals(liveStream.closed, true);
+
+  // Now: create a new stream pre-populated with the live stream's events
+  const liveEvents = liveStream.read().map((e) => e.event);
+  const replayStream = InMemoryDurableStream.from(liveEvents, true);
+  const replayLengthBefore = replayStream.length;
+
+  let replayChildEnterCount = 0;
+
+  // Replay with the same operation structure
+  resetIds();
+  const replayResult = await durableRun(replayStream, function* parent(): Operation<number> {
+    const child = yield* spawn(function* child() {
+      yield* action<void>((resolve) => {
+        replayChildEnterCount++;
+        resolve(undefined as never);
+        return () => {};
+      }, "child-work");
+      return 42;
+    });
+    return yield* child;
+  });
+
+  assertEquals(replayResult, 42, "replay must produce the same result");
+
+  // KEY: no child effects were entered during replay
+  assertEquals(replayChildEnterCount, 0, "replay must NOT enter child effects");
+
+  // KEY: no new events were written
+  assertEquals(replayStream.length, replayLengthBefore, "no new events on replay of complete stream");
+  assertEquals(replayStream.closed, true);
 });
