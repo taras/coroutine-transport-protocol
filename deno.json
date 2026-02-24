@@ -1,5 +1,6 @@
 {
   "imports": {
-    "effection": "jsr:@effection/effection@^4.0.2"
+    "effection": "../frontside/effection/mod.ts",
+    "effection/durable": "../frontside/effection/lib/durable/mod.ts"
   }
 }
