@@ -16,21 +16,35 @@ Create a version of [Effection](https://github.com/thefrontside/effection) that 
 - `~/Repositories/frontside/effection` (branch: `durable-internals`) — Fork with DurableReducer implementation + Effection's own test suite as validation
 - `~/Repositories/cowboyd/coroutine-transport-protocol` — Consumer/demo project, imports from fork
 
-## Current Status: Phase 2 Complete
+## Current Status: All Phases Complete
 
-- All 23 Effection `run.test.ts` tests pass (previously 4 were skipped — now un-skipped)
-- 13 durable-specific tests pass (recording, replay, mid-workflow resume, divergence, halt)
-- 12 scope lifecycle tests pass (scope:created, scope:destroyed, parent-child hierarchy, scope IDs in effects, replay with scope events, error recording, halt lifecycle)
-- 191 total test steps passing across 25 test suites (0 failures)
+- All 27 Effection `run.test.ts` steps pass
+- 139 total test steps passing across 13 test suites (0 failures)
 - Effection fork pushed to `taras/effection` (branch: `durable-internals`)
-- Next: Phase 3 (workflow:return wiring + durable spawn resume + divergence validation)
+- All 7 implementation phases complete — DurableReducer handles recording, replay, mid-workflow resume, divergence detection, and scope lifecycle for all Effection primitives
+
+### Test Inventory
+| Suite | Steps | Coverage |
+|-------|-------|----------|
+| `run.test.ts` | 27 | Effection core (validation) |
+| `durable.test.ts` | 25 | Recording, replay, resume, divergence, halt, workflow:return, spawn resume |
+| `durable-scope.test.ts` | 14 | Scope lifecycle, hierarchy, error, halt |
+| `durable-all-race.test.ts` | 15 | all(), race(), combined nesting |
+| `durable-resource.test.ts` | 12 | Resource, ensure, resource+spawn |
+| `durable-each.test.ts` | 11 | each() recording, replay, resume, sync streams |
+| `durable-error-suspend-context.test.ts` | 22 | Error replay, suspend replay, context recording/replay |
+
+### Key Design Insights
+- **Generator delegation runs during replay**: `yield* stream` (generator delegation) is not an Effection effect — the reducer can only suppress `effect.enter()`, not generator code between yield points. Durable invariants assert no `effect.enter()` calls and no new `effect:yielded` events, not that generators don't run.
+- **Context events are informational**: `scope:set`/`scope:delete` are recorded for observability but not rehydrated during replay. Context operations re-execute live as infrastructure effects (`do <set(...)>`).
+- **Scope-aware replay**: Per-scope cursors handle concurrent interleaving correctly. Effects from `each()`'s spawned child land in the child scope, while `each.next()` effects land in the caller scope.
 
 ## Implementation Phases
 
 1. ✅ DurableReducer + action/sleep
 2. ✅ Api.Scope middleware + scope lifecycle events
-3. ⬜ Durable spawn + generation counter (re-scoped: workflow:return wiring + durable spawn resume + divergence validation)
-4. ⬜ Durable resource + ensure
-5. ⬜ Durable all + race
-6. ⬜ Durable each
-7. ⬜ Error handling + suspend + context
+3. ✅ Durable spawn + workflow:return wiring + divergence validation
+4. ✅ Durable resource + ensure
+5. ✅ Durable all + race
+6. ✅ Durable each
+7. ✅ Error handling + suspend + context
