@@ -87,6 +87,10 @@ interface DurableContext {
   replayQueues: Map<string, ReplayEntry[]>;
   /** Per-scope replay cursors: scopeId → current index */
   replayCursors: Map<string, number>;
+  /** Per-parent child scope replay: parentScopeId → ordered child scopeIds */
+  childScopeQueues: Map<string, string[]>;
+  /** Per-parent child scope cursors: parentScopeId → current index */
+  childScopeCursors: Map<string, number>;
 }
 
 interface ReplayEntry {
@@ -130,6 +134,19 @@ function buildReplayQueues(entries: StreamEntry[]): Map<string, ReplayEntry[]> {
   return queues;
 }
 
+function buildChildScopeQueues(entries: StreamEntry[]): Map<string, string[]> {
+  const queues = new Map<string, string[]>();
+  for (const { event } of entries) {
+    if (event.type === "scope:created" && event.parentScopeId) {
+      if (!queues.has(event.parentScopeId)) {
+        queues.set(event.parentScopeId, []);
+      }
+      queues.get(event.parentScopeId)!.push(event.scopeId);
+    }
+  }
+  return queues;
+}
+
 function isStreamComplete(entries: StreamEntry[]): boolean {
   if (entries.some(({ event }) => event.type === "workflow:return")) {
     return true;
@@ -166,6 +183,30 @@ export class DivergenceError extends Error {
   }
 }
 
+// ── Live-Only Placeholder ──────────────────────────────────────────
+//
+// When an effect resolves with a non-JSON-serializable value (e.g.,
+// an Iterable, Coroutine, or other complex object), we store a
+// __liveOnly sentinel in the stream. On replay, the runner detects
+// this sentinel and lets the real effect's enter() run instead of
+// feeding back a placeholder — the value must be re-materialized live.
+
+interface LiveOnlyPlaceholder {
+  __liveOnly: true;
+  __type: string;
+  __toString: string;
+}
+
+function isLiveOnlyPlaceholder(value: unknown): value is LiveOnlyPlaceholder {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    "__liveOnly" in (value as Record<string, unknown>) &&
+    (value as Record<string, unknown>).__liveOnly === true
+  );
+}
+
 // ── toJson ─────────────────────────────────────────────────────────
 
 function toJson(value: unknown, ctx: DurableContext): Json {
@@ -178,7 +219,7 @@ function toJson(value: unknown, ctx: DurableContext): Json {
     }
   }
   if (isJsonSafe(value)) return value;
-  return { __type: typeof value, __toString: String(value) } as Json;
+  return { __liveOnly: true, __type: typeof value, __toString: String(value) } as Json;
 }
 
 // ── Wrap Scope ─────────────────────────────────────────────────────
@@ -195,7 +236,24 @@ function wrapScope(
     get(target, prop, receiver) {
       if (prop === "run") {
         return <T>(childOp: () => Operation<T>): Task<T> => {
-          const childScopeId = genScopeId();
+          // During replay, reuse stored child scope IDs to stay
+          // aligned with the stream. During live execution, generate
+          // new IDs.
+          const childQueue = ctx.childScopeQueues.get(parentScopeId) ?? [];
+          if (!ctx.childScopeCursors.has(parentScopeId)) {
+            ctx.childScopeCursors.set(parentScopeId, 0);
+          }
+          const childCursor = ctx.childScopeCursors.get(parentScopeId)!;
+
+          let childScopeId: string;
+          if (childCursor < childQueue.length) {
+            // Replay: reuse stored child scope ID
+            childScopeId = childQueue[childCursor];
+            ctx.childScopeCursors.set(parentScopeId, childCursor + 1);
+          } else {
+            // Live: generate new ID
+            childScopeId = genScopeId();
+          }
 
           if (!ctx.streamComplete) {
             ctx.stream.append({
@@ -236,6 +294,28 @@ function wrapOperation<T>(
         ctx.replayCursors.set(scopeId, 0);
       }
 
+      // If any effect in this scope's replay queue resolved with
+      // a non-serializable value, skip replay for the entire scope.
+      // Re-executing individual effects while replaying others
+      // causes divergence (Effection internals take different code
+      // paths depending on whether they receive real objects vs
+      // placeholders). The all-or-nothing approach is safer:
+      // either replay all effects (when all results are serializable)
+      // or re-execute all effects (when any result is non-serializable).
+      //
+      // Exception: useCoroutine() produces non-serializable Coroutine
+      // objects, but Effection's internal machinery (resource, all,
+      // race, etc.) tolerates receiving placeholder objects for these.
+      // So useCoroutine() __liveOnly results don't trigger a scope
+      // replay skip.
+      const hasLiveOnlyResults = replayQueue.some(
+        (entry) =>
+          entry.result.ok &&
+          isLiveOnlyPlaceholder(entry.result.value) &&
+          entry.description !== "useCoroutine()",
+      );
+      const effectiveReplayQueue = hasLiveOnlyResults ? [] : replayQueue;
+
       return {
         next(value?: unknown): IteratorResult<Effect<unknown>, T> {
           let result: IteratorResult<Effect<unknown>, T>;
@@ -274,8 +354,8 @@ function wrapOperation<T>(
           const cursor = ctx.replayCursors.get(scopeId)!;
 
           // ── Replay phase ──
-          if (cursor < replayQueue.length) {
-            const entry = replayQueue[cursor];
+          if (cursor < effectiveReplayQueue.length) {
+            const entry = effectiveReplayQueue[cursor];
 
             if (entry.description !== effect.description) {
               throw new DivergenceError(cursor, entry.description, effect.description);
@@ -283,6 +363,20 @@ function wrapOperation<T>(
 
             ctx.replayCursors.set(scopeId, cursor + 1);
 
+            // If the stored result is a non-serializable placeholder,
+            // fall through to live execution: the value must be
+            // re-materialized by calling the real effect's enter().
+            // We advance the cursor (above) to stay aligned, but
+            // pass through the original effect without recording
+            // duplicate events (they already exist in the stream).
+            //
+            // Exception: useCoroutine() returns non-serializable
+            // Coroutine objects that feed into Effection's internal
+            // resource/trap machinery. Re-executing useCoroutine()
+            // live produces a real Coroutine that causes resource()
+            // to take a different code path, changing the effect
+            // sequence. So useCoroutine() must be replayed with the
+            // placeholder — Effection internals tolerate it.
             const syntheticEffect: Effect<unknown> = {
               description: effect.description,
               enter(resolve, routine) {
@@ -410,6 +504,8 @@ export function durableRun<T>(
     scopeIds: new WeakMap(),
     replayQueues: buildReplayQueues(existingEntries),
     replayCursors: new Map(),
+    childScopeQueues: buildChildScopeQueues(existingEntries),
+    childScopeCursors: new Map(),
   };
 
   // Determine root scopeId: reuse from stream or generate new
