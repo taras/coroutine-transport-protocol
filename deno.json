@@ -1,5 +1,5 @@
 {
   "imports": {
-    "effection": "jsr:@effection/effection@^4.0.2"
+    "effection": "jsr:@effection/effection@4.1.0-alpha.5"
   }
 }
