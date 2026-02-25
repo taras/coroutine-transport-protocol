@@ -1,13 +1,30 @@
 {
   "imports": {
     "effection": "../../frontside/effection/mod.ts",
-    "effection/durable": "../../frontside/effection/lib/durable/mod.ts",
+    "effection/experimental": "../../frontside/effection/experimental.ts",
+    "@effectionx/durably": "../../frontside/effectionx/durably/mod.ts",
+    "@effectionx/durably/http": "../../frontside/effectionx/durably/http.ts",
+    "@effectionx/inspector": "../../frontside/inspector/loader.ts",
+    "@effectionx/inspector/lib": "../../frontside/inspector/mod.ts",
+    "@effectionx/stream-helpers": "../../frontside/effectionx/stream-helpers/mod.ts",
+    "@effectionx/signals": "../../frontside/effectionx/signals/mod.ts",
+    "@effectionx/timebox": "../../frontside/effectionx/timebox/mod.ts",
+    "@ark/util": "npm:@ark/util@^0.56.0",
+    "@standard-schema/spec": "npm:@standard-schema/spec@^1.0.0",
+    "arktype": "npm:arktype@^2.1.27",
+    "h3": "npm:h3@2.0.1-rc.14",
+    "immutable": "npm:immutable@^5",
+    "parse-sse": "npm:parse-sse@^0.1.0",
+    "remeda": "npm:remeda@^2",
     "@durable-streams/client": "npm:@durable-streams/client",
     "@durable-streams/server": "npm:@durable-streams/server"
   },
   "tasks": {
     "demo:server": "deno run --allow-all demo/server.ts",
     "demo:run": "deno run --allow-all demo/pipeline.ts",
-    "demo:read": "npx @durable-streams/cli read durable-effection-demo"
+    "demo:nested-each": "deno run --allow-all --preload ../../frontside/inspector/loader.ts demo/nested-each.ts",
+    "demo:inspect": "deno run --allow-all --preload ../../frontside/inspector/loader.ts demo/pipeline.ts",
+    "demo:read": "npx @durable-streams/cli read durable-effection-demo",
+    "demo:read:nested-each": "npx @durable-streams/cli read durable-effection-nested-each-demo-v4"
   }
 }

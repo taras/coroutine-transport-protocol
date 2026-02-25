@@ -20,9 +20,10 @@
  *   deno task demo:run
  */
 
-import { durableMain } from "../lib/durable-main.ts";
-import { sleep, call } from "effection";
+import { main, sleep, call, suspend } from "effection";
 import type { Operation } from "effection";
+import { durably } from "@effectionx/durably";
+import { useDurableStream } from "@effectionx/durably/http";
 
 const STREAM_URL = "http://localhost:4437/durable-effection-demo";
 
@@ -59,4 +60,8 @@ function* pipeline(): Operation<void> {
   console.log(`=== Total time: ${totalTime}s ===\n`);
 }
 
-await durableMain(STREAM_URL, () => pipeline());
+await main(function* () {
+  let stream = yield* useDurableStream(STREAM_URL);
+
+  yield* durably(() => pipeline(), { stream });
+});

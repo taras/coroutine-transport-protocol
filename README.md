@@ -276,3 +276,20 @@ effection (fork)                  # github.com/taras/effection branch: durable-i
 # In the Effection fork (~/Repositories/frontside/effection, branch: durable-internals)
 deno test --allow-all
 ```
+
+## Demo Commands
+
+```bash
+# In this repo
+deno task demo:server
+
+# Original simple pipeline demo
+deno task demo:run
+
+# New nested each() demo (nested loops + retries + timeout race)
+deno task demo:nested-each
+
+# Inspect stream events
+deno task demo:read
+deno task demo:read:nested-each
+```
