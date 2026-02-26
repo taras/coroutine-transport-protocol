@@ -152,3 +152,106 @@ Context events (`scope:set`, `scope:delete`) are purely informational — they'r
 - Keep outbound (`yield`/`close`) and inbound (`next`) as separate union types — they're produced/consumed on opposite sides
 - For `close`, use a three-way discriminant: `{ status: "ok", value: T } | { status: "err", error: E } | { status: "cancelled" }`
 - Request/response pairing via sequence numbers on `yield` events, referenced by `next` events
+
+---
+
+## Decisions (Session 2026-02-26)
+
+### Decision 1: Single Flat Stream with Correlation IDs → Option B
+
+**Chosen approach**: Single flat stream per workflow, with `coroutineId` +
+`effectId` on every event for concurrency attribution.
+
+**Rationale**: Durable Streams have no atomic multi-stream operations. With
+nested/separate streams, creating a child stream and recording the reference in
+the parent are two independent HTTP POSTs — a crash between them leaves
+inconsistent state. This atomicity gap is an unacceptable consistency risk for
+durable execution. A single stream preserves the fundamental property:
+**one stream, one offset, one checkpoint**.
+
+The stream URL is the workflow identity. Within the stream, `coroutineId`
+(derived from `DurableOperation.id`) identifies which logical coroutine
+produced each event, and `effectId` pairs each `yield` with its `next`
+response.
+
+**Why not nested streams** (evaluated and rejected):
+- No atomic multi-stream operations in Durable Streams protocol
+- Crash between creating child stream and recording parent reference =
+  inconsistent state
+- HTTP overhead scales linearly with concurrency (N streams = N producers,
+  N connections)
+- No cascading closure — structured concurrency cleanup must be enforced
+  externally
+- Per-workflow snapshot requires coordinating N stream offsets atomically
+- The upside (cleaner per-coroutine protocol) does not justify these risks
+
+**What this preserves**:
+- Single append-only stream = single checkpoint = transactional
+- Idempotent producer with one `(producerId, epoch, seq)` tuple
+- One HTTP connection per workflow
+- Stream offset after last event is the complete resume point
+
+**How attribution works**:
+- `coroutineId` on every event groups events by logical coroutine
+- `effectId` links each `yield` to its `next` response
+- Replay engine filters by `coroutineId` for per-coroutine cursors (same
+  pattern as the current `ReplayIndex` with `scopeId`, but using the
+  `DurableOperation.id` instead of ordinal scope IDs)
+
+### Decision 2: Cancellation → `close<None>`
+
+**Chosen approach**: Three-way terminal state: `close<Ok(value)>` | `close<Err(error)>` | `close<None>`.
+
+**Rationale**:
+- Cancellation in Effection is intentional (parent decided to stop child), not an error. A halted scope runs its cleanup successfully.
+- Observers (dashboards, debuggers) should see "cancelled" — a valid terminal state — not "failed".
+- Cross-language compatibility: not every runtime has exceptions. "Stopped without result" is universal.
+
+**TypeScript representation**:
+```typescript
+type Close<T, E> =
+  | { status: "ok"; value: T }
+  | { status: "err"; error: E }
+  | { status: "cancelled" }
+```
+
+### Decision 3: `next()` as Separate Entry → Forced by Protocol
+
+**Chosen approach**: `next()` (inbound response) is a separate stream entry, not paired with `yield`.
+
+**Rationale**: This is not a design choice — it's a constraint. Durable Streams are **append-only and immutable by position**. The protocol explicitly states: "Streams are durable and immutable by position; new data can only be appended." There is no update-in-place operation.
+
+Pairing `next()` with `yield` would require mutating the `yield` entry at offset N when the response arrives. This is impossible. Therefore `yield` is appended at offset N, and `next` is appended at offset N+1 (or later). Each is an independent, immutable event.
+
+This is actually beneficial:
+- The stream is a self-describing bidirectional conversation: what the coroutine asked for and what it received
+- Append-only semantics simplify both writing and reading
+- A `yield` without a following `next` naturally represents an interrupted coroutine (the "boundary healing" case)
+
+### Revised Protocol Summary
+
+With all three decisions, the protocol for a single flat stream is:
+
+```
+Outbound (coroutine → stream):
+  yield  { coroutineId, effectId, description }
+  close  { coroutineId, status: "ok", value }
+  close  { coroutineId, status: "err", error }
+  close  { coroutineId, status: "cancelled" }
+
+Inbound (response → stream):
+  next   { coroutineId, effectId, status: "ok", value }
+  next   { coroutineId, effectId, status: "err", error }
+
+Structural:
+  spawn  { coroutineId, childCoroutineId }
+```
+
+One workflow = one stream. The stream URL is the workflow identity. All
+coroutines (parent and children from spawn/all/race/each) write to the same
+stream. The stream offset after the last written event is the single checkpoint
+for the entire workflow. On resume, the replay engine reads the stream and
+routes events to coroutines by `coroutineId`.
+
+See the full event schema in
+[DURABLE_NATIVE_SPEC.md](https://github.com/thefrontside/effectionx/blob/feat/durable-native-package-spec/durably/DURABLE_NATIVE_SPEC.md).
