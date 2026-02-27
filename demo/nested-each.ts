@@ -5,15 +5,15 @@
  * with explicit nested `each()` loops.
  *
  * Run 1:
- *   deno task demo:nested-each
+ *   pnpm demo:nested-each
  *   # Ctrl+C mid-run (for example during batch-b)
  *
  * Run 2:
- *   deno task demo:nested-each
+ *   pnpm demo:nested-each
  *   # replayed prefix is instant, then frontier continues live
  *
  * Prerequisites:
- *   deno task demo:server
+ *   pnpm demo:server
  */
 // deno-lint-ignore-file
 

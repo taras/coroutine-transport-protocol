@@ -1,0 +1,30 @@
+{
+  "name": "ctp-durably",
+  "version": "0.1.0",
+  "description": "Design exploration and demo project for Durable Effection",
+  "type": "module",
+  "scripts": {
+    "demo:server": "npx tsx demo/server.ts",
+    "demo:run": "npx tsx demo/pipeline.ts",
+    "demo:nested-each": "npx tsx demo/nested-each.ts",
+    "demo:read": "npx @durable-streams/cli read durable-effection-demo",
+    "demo:read:nested-each": "npx @durable-streams/cli read durable-effection-nested-each-demo-v4",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@durable-streams/client": "^0.2.1",
+    "@durable-streams/server": "^0.2.0",
+    "@effectionx/durably": "https://pkg.pr.new/thefrontside/effectionx/@effectionx/durably@171",
+    "effection": "https://pkg.pr.new/thefrontside/effection@1127",
+    "json-colorizer": "^3.0.1",
+    "json-stringify-pretty-compact": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4",
+    "typescript": "^5.7"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

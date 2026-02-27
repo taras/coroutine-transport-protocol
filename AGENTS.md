@@ -8,21 +8,25 @@ The core implementation has been extracted into [`@effectionx/durably`](https://
 
 - **`@effectionx/durably`** — `durably()` entry point, `DurableReducer`, `InMemoryDurableStream`, types
 - **`@effectionx/durably/http`** — `useDurableStream()` resource for HTTP-backed persistence via `@durable-streams/client`
-- **`effection`** — from fork (`~/Repositories/frontside/effection`, branch with PR 1127 experimental exports)
-- **`effection/experimental`** — reducer internals needed by durably
+- **`effection`** — preview from [PR #1127](https://github.com/thefrontside/effection/pull/1127) (experimental reducer exports)
 
-## Repository Layout
+## Setup
 
-- `~/Repositories/frontside/effectionx/durably/` — `@effectionx/durably` package (PR #171)
-- `~/Repositories/frontside/effection/` — Effection fork (PR #1127 — experimental reducer exports)
-- `~/Repositories/cowboyd/coroutine-transport-protocol/` — This repo: demo + documentation
+This project uses **pnpm** and **Node.js 22+**:
+
+```bash
+pnpm install
+```
+
+Dependencies use pkg.pr.new previews:
+- `effection@https://pkg.pr.new/thefrontside/effection@1127`
+- `@effectionx/durably@https://pkg.pr.new/thefrontside/effectionx/@effectionx/durably@171`
 
 ## Current Status
 
-- The `lib/` directory has been removed — `HttpDurableStream` and `useDurableStream` now live in `@effectionx/durably/http`
-- `demo/pipeline.ts` imports directly from the package
-- `demo/server.ts` runs a Durable Streams test server (unchanged)
-- `deno.json` import map points to local checkouts of effection and effectionx
+- Uses pnpm/Node instead of Deno (no relative paths to local checkouts)
+- `demo/pipeline.ts` imports directly from npm packages
+- `demo/server.ts` runs a Durable Streams test server using Node HTTP
 
 ## Key Design Insights
 

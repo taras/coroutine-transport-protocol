@@ -6,18 +6,18 @@
  * giving ample opportunity to interrupt mid-execution.
  *
  * Run 1 (recording):
- *   deno task demo:run
+ *   pnpm demo:run
  *   # Ctrl+C after processing a few items
  *
  * Run 2 (replay + resume):
- *   deno task demo:run
+ *   pnpm demo:run
  *   # Replayed steps complete instantly, then continues live
  *
  * Prerequisites:
- *   deno task demo:server  (in another terminal)
+ *   pnpm demo:server  (in another terminal)
  *
  * Usage:
- *   deno task demo:run
+ *   pnpm demo:run
  */
 
 import { main, sleep, call, suspend } from "effection";
