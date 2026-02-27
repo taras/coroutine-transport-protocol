@@ -426,21 +426,191 @@ counters.
 **Validation:** Concurrency test suite must pass. Additionally, add
 tests that verify coroutine IDs are stable across live and replay runs.
 
-## 8. Risks and Open Questions
+## 8. Risks and Analysis
 
-### Spawn Ordering Edge Cases
+### Spawn During Teardown: The Sharpest Risk
 
-The determinism argument covers `all()`, `race()`, and sequential `spawn()`.
-Potential edge cases to verify:
+This is the most dangerous edge case for the deterministic ID scheme.
+It initially appears to create a circular dependency:
 
-- **Spawn during teardown:** When a scope is being destroyed, can new
-  children be spawned? If so, is the teardown order deterministic?
-- **Spawn from within `ensure()`:** Ensure blocks run during scope
-  destruction — do they spawn in a stable order?
-- **Dynamic spawn counts:** If replay takes a different branch and spawns
-  a different number of children, the counters will diverge. This should
-  trigger a divergence error via description mismatch on the next `yield`,
-  but needs testing.
+> ID assignment depends on execution order → which depends on scope
+> tree shape → which depends on ID assignment
+
+Here's the concrete scenario:
+
+```typescript
+yield* all([
+  function*() {
+    yield* ensure(function*() {
+      yield* spawn(function*() {   // ← spawn during teardown
+        yield* sleep(100);
+      });
+    });
+    yield* suspend();
+  },
+  function*() {
+    yield* sleep(500);
+  },
+]);
+```
+
+When the `all()` completes, the first branch is torn down, its
+`ensure()` block fires, and a new child scope is spawned — all during
+destruction. Does the per-parent counter produce the same ID during
+replay?
+
+#### How Effection Destruction Works
+
+Scopes maintain a `destructors` Set. When a scope is destroyed:
+
+```typescript
+// scope-internal.ts — destroy()
+for (let destructor of destructors) {
+  destructors.delete(destructor);
+  yield* destructor();      // ← runs each destructor in insertion order
+}
+```
+
+`Set` iterates in **insertion order**. Destructors are registered in
+two ways:
+
+1. **Child scope creation:** When `scope.run()` creates a child, the
+   child's `destroy()` function is registered as an `ensure()` callback
+   on the parent:
+
+   ```typescript
+   // scope-internal.ts — buildScopeInternal()
+   let destroy = () => api.invoke(scope, "destroy", [scope]);
+   let unbind = parent ? parent.ensure(destroy) : () => {};
+   ```
+
+2. **Explicit `ensure()` calls:** User code registers teardown callbacks
+   directly.
+
+Both register into the same `destructors` Set, and the insertion order
+is determined by when the registration happened during **forward
+execution** — which is deterministic.
+
+#### Why the Circular Dependency Doesn't Exist
+
+The apparent cycle breaks because **IDs do not influence teardown
+order**:
+
+1. **Teardown order** is determined by the `destructors` Set insertion
+   order, which is determined by the order that child scopes were
+   created and `ensure()` callbacks were registered during forward
+   execution.
+
+2. **Forward execution order is deterministic** (as proven in Section 3:
+   synchronous reduce loop, generators are deterministic, `all()`/`race()`
+   spawn in array order).
+
+3. **Therefore teardown order is deterministic** — it follows forward
+   creation order (FIFO, not LIFO).
+
+4. **Spawns during teardown** get counter-assigned IDs based on the
+   per-parent counter, which increments in the same sequence because
+   the teardown code path is the same.
+
+The key insight: IDs are an **output** of the deterministic execution
+order, not an **input** to it. The scope tree shape is determined by
+the code, not by the IDs.
+
+#### Trace Through the Scenario
+
+**Live execution:**
+
+```
+all() spawns two children:
+  root.0  (first branch — has ensure callback)
+  root.1  (second branch — sleep(500))
+
+Forward execution:
+  root.0 registers ensure() → added to root.0's destructors Set
+  root.0 suspends
+  root.1 sleeps 500ms → completes → all() settles
+
+Teardown of root.0:
+  destructors Set = [ensure_callback, ...]
+  ensure_callback fires:
+    yield* spawn(fn) → creates child scope
+    root.0's per-parent counter: 0 → child gets "root.0.0"
+    root.0.0 runs sleep(100)
+```
+
+**Replay:**
+
+```
+all() spawns two children:
+  root.0  (same — deterministic)
+  root.1  (same — deterministic)
+
+Forward execution (replayed instantly):
+  root.0 registers ensure() → same insertion into destructors Set
+  root.0 suspends (replayed)
+  root.1 sleeps (replayed) → all() settles
+
+Teardown of root.0:
+  destructors Set = [ensure_callback, ...]  ← same insertion order
+  ensure_callback fires:
+    yield* spawn(fn) → creates child scope
+    root.0's per-parent counter: 0 → child gets "root.0.0"  ← same ID
+    root.0.0 runs sleep(100) (live or replayed)
+```
+
+The counter path is identical because the `destructors` Set was
+populated in the same deterministic order during forward execution.
+
+#### Important Note: FIFO Teardown
+
+Effection tears down in **insertion order** (FIFO), not reverse creation
+order (LIFO). This is unlike most frameworks but doesn't affect the
+determinism argument — insertion order is deterministic regardless of
+direction.
+
+#### Required Test Case
+
+The following test should verify counter stability across live and
+replay for spawn-during-teardown:
+
+```typescript
+// Verify: ensure() block that spawns a child, where the ensure
+// block is inside a scope that was spawned by all().
+// The spawned child's coroutine ID must be identical across runs.
+
+function* workflow(): Operation<void> {
+  yield* all([
+    function*() {
+      yield* ensure(function*() {
+        let task = yield* spawn(function*() {
+          yield* sleep(50);
+        });
+        yield* task;
+      });
+      yield* suspend();
+    },
+    function*() {
+      yield* sleep(200);
+      return;
+    },
+  ]);
+}
+
+// Run 1: record to stream
+// Run 2: replay from stream
+// Assert: coroutine IDs in stream are identical in both runs
+```
+
+### Dynamic Spawn Counts
+
+If replay takes a different branch and spawns a different number of
+children, the per-parent counters will diverge. This is expected and
+correct — it means the code has changed between runs. The divergence
+will be caught at the next `yield` where the description no longer
+matches, producing a `DivergenceError`.
+
+This is the same behavior as the current protocol — if the code changes,
+replay detects it via description mismatch.
 
 ### Loss of "Pending Effect" Visibility
 
