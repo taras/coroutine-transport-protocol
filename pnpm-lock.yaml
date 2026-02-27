@@ -17,6 +17,9 @@ importers:
       '@effectionx/durably':
         specifier: https://pkg.pr.new/thefrontside/effectionx/@effectionx/durably@171
         version: https://pkg.pr.new/thefrontside/effectionx/@effectionx/durably@171(@durable-streams/client@0.2.1)(effection@https://pkg.pr.new/thefrontside/effection@1127)
+      '@effectionx/node':
+        specifier: ^0.2.2
+        version: 0.2.2(effection@https://pkg.pr.new/thefrontside/effection@1127)
       effection:
         specifier: https://pkg.pr.new/thefrontside/effection@1127
         version: https://pkg.pr.new/thefrontside/effection@1127
@@ -63,6 +66,13 @@ packages:
     peerDependenciesMeta:
       '@durable-streams/client':
         optional: true
+
+  '@effectionx/node@0.2.2':
+    resolution: {integrity: sha512-bUwnCqzBsVERGzKZRTc6XMZ6yDLkRPgcxSvM6eAkuc2D5A7L0+nSu4J/x60y6geSYrAVv2UZBgAktukNtB6LxA==}
+    version: 0.2.2
+    engines: {node: '>= 22'}
+    peerDependencies:
+      effection: ^3 || ^4
 
   '@esbuild/aix-ppc64@0.27.3':
     resolution: {integrity: sha512-9fJMTNFTWZMh5qwrBItuziu834eOCUcEqymSH7pY+zoMVEZg3gcPuBNxH1EvfVYe9h0x/Ptw8KBzv7qxb7l8dg==}
@@ -427,6 +437,10 @@ snapshots:
       effection: https://pkg.pr.new/thefrontside/effection@1127
     optionalDependencies:
       '@durable-streams/client': 0.2.1
+
+  '@effectionx/node@0.2.2(effection@https://pkg.pr.new/thefrontside/effection@1127)':
+    dependencies:
+      effection: https://pkg.pr.new/thefrontside/effection@1127
 
   '@esbuild/aix-ppc64@0.27.3':
     optional: true
