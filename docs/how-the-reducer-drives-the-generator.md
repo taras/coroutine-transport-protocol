@@ -8,6 +8,94 @@ In Effection, every generator-based operation is wrapped in a **Coroutine**. The
 
 The `DurableReducer` replaces Effection's standard reducer via `ReducerContext` injection. It intercepts the single point where all effects execute, adding recording and replay.
 
+## Lifecycle Diagram
+
+```
+                       ┌─────────────────────────────┐
+                       │     durable(fn, { stream })  │
+                       └──────────────┬──────────────┘
+                                      │
+                       ┌──────────────▼──────────────┐
+                       │  Read stream → ReplayIndex   │
+                       │  Install scope middleware    │
+                       │  Set ReducerContext          │
+                       └──────────────┬──────────────┘
+                                      │
+                       ┌──────────────▼──────────────┐
+                       │   scope.run(operation)       │
+                       │   generator starts           │
+                       └──────────────┬──────────────┘
+                                      │
+             ┌────────────────────────▼────────────────────────┐
+             │               reduce(instruction)               │
+             │                                                 │
+             │  iterator.next(previousValue)                   │
+             │       │                                         │
+             │       ▼                                         │
+             │  generator yields Effect { description, enter } │
+             │       │                                         │
+             │       ▼                                         │
+             │  handleEffect(effect, routine)                  │
+             └───────┬─────────────────────────┬──────────────┘
+                     │                         │
+          ┌──────────▼──────────┐   ┌──────────▼──────────┐
+          │   Classify Effect   │   │   Classify Effect   │
+          │  → infrastructure   │   │   → user-facing     │
+          └──────────┬──────────┘   └──────────┬──────────┘
+                     │                         │
+                     ▼                         ▼
+            ┌────────────────┐     ┌────────────────────────┐
+            │  Execute live  │     │  replayIndex.peekYield │
+            │  effect.enter()│     │  (coroutineId)         │
+            │ (not recorded) │     └─────┬────────────┬─────┘
+            └────────────────┘           │            │
+                                    has event    no event
+                                         │            │
+                          ┌──────────────▼──┐  ┌──────▼─────────────┐
+                          │   REPLAY PATH   │  │     LIVE PATH      │
+                          │                 │  │                    │
+                          │ Divergence      │  │ stream.append({   │
+                          │ check: does     │  │   type: "yield",  │
+                          │ description     │  │   effectId,       │
+                          │ match?          │  │   description     │
+                          │   │             │  │ })                │
+                          │  yes            │  │                    │
+                          │   │             │  │ Wrap routine.next  │
+                          │ Look up "next"  │  │ to record result   │
+                          │ event by        │  │                    │
+                          │ effectId        │  │ effect.enter()     │
+                          │   │             │  │                    │
+                          │ Feed recorded   │  │  ... runs live ... │
+                          │ result directly │  │                    │
+                          │ to generator    │  │ wrappedNext fires: │
+                          │ via             │  │  stream.append({  │
+                          │ routine.next()  │  │    type: "next",  │
+                          │                 │  │    effectId,      │
+                          │ (effect.enter   │  │    status, value  │
+                          │  never called)  │  │  })               │
+                          │                 │  │  originalNext()   │
+                          └────────┬────────┘  └──────────┬────────┘
+                                   │                      │
+                                   └──────────┬───────────┘
+                                              │
+                                              ▼
+                                   ┌─────────────────────┐
+                                   │ generator receives   │
+                                   │ value, continues     │
+                                   │                      │
+                                   │ synchronous code     │
+                                   │ runs between yields: │
+                                   │  queue.add()         │
+                                   │  console.log()       │
+                                   │  array.push()        │
+                                   └──────────┬──────────┘
+                                              │
+                                              ▼
+                                   next yield* ───┐
+                                                  │
+                                    back to reduce()
+```
+
 ## Step-by-Step Sequence
 
 ### 1. Setup — `durable()` is called
