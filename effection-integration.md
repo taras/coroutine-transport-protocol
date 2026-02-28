@@ -1,8 +1,8 @@
 # Durable Execution for Effection: Architecture Research
 
-**Status:** Research synthesis for review
+**Status:** Validated through implementation — Tier 1-2 tests passing
 **Audience:** Charles, Taras
-**Inputs:** Two-event durable execution spec (v2), Effection source (lib/), AGENTS.md, Charles's type-constraint feedback
+**Inputs:** Two-event durable execution spec (v2), Effection source (lib/), AGENTS.md, Charles's type-constraint feedback, implementation + DECISIONS.md
 
 ---
 
@@ -10,16 +10,25 @@
 
 This document maps the two-event durable execution protocol onto Effection's
 runtime architecture and incorporates Charles's insight that **type-level
-constraints** should replace runtime effect classification. The key conclusion:
+constraints** should replace runtime effect classification. The design has
+been **validated through implementation** — Tier 1 (core replay) and Tier 2
+(divergence detection) tests are passing. Key conclusions:
 
 - Effection's reducer does not need to change.
 - Durability is implemented entirely within a new `DurableEffect` type whose
   `enter()` method handles replay, divergence detection, and persist-before-resume.
 - A `Workflow<T>` type constrains generators at compile time so that only
   durable-safe effects can be yielded. All `Workflow`s are `Operation`s, but
-  not all `Operation`s are `Workflow`s.
+  not all `Operation`s are `Workflow`s. No casts needed at the boundary (DEC-015).
 - Scope management (coroutine IDs, Close events) is layered via Effection's
   existing `Context` and `Api.around()` systems.
+- The Durable Streams protocol provides a strong backend fit (see companion
+  document `durable-streams.md`).
+
+**Implementation artifacts:** `lib/` contains 8 modules (types, replay-index,
+effect, operations, run, context, stream, serialize). `test/` contains 4 test
+files with 40+ tests across types, replay-index, durable-run (Tier 1), and
+divergence (Tier 2). 18 architectural decisions recorded in `DECISIONS.md`.
 
 ---
 
@@ -217,7 +226,13 @@ The ensure callback is the natural hook for emitting Close events.
 
 ---
 
-## 4. Charles's type-constraint architecture
+## 4. Charles's type-constraint architecture (validated)
+
+The following design was proposed by Charles and has been validated
+through implementation. Key confirmation: DEC-009 (`Workflow<T>` =
+`Generator<DurableEffect<unknown>, T, unknown>` enforces yield
+constraints at compile time) and DEC-015 (`Workflow<T>` is directly
+assignable to `Operation<T>` — no casts needed).
 
 ### 4.1 The problem with runtime classification
 
@@ -285,7 +300,10 @@ durable execution. There's no "am I in replay mode?" question — the
 
 ---
 
-## 5. DurableEffect implementation
+## 5. DurableEffect implementation (validated)
+
+The following design is implemented in `lib/effect.ts` and tested
+across Tier 1-2 (14 tests passing).
 
 ### 5.1 The enter() method does everything
 
@@ -375,7 +393,7 @@ function createDurableEffect<T>(
 }
 ```
 
-### 5.2 How this satisfies spec invariants
+### 5.2 How this satisfies spec invariants (verified by tests)
 
 **Persist-before-resume (§5, hard invariant).** During live execution,
 `resolve()` is called inside the `.then()` callback of the stream append.
@@ -411,10 +429,11 @@ synchronous reduce cycle.
 
 ---
 
-## 6. Workflow-enabled effects
+## 6. Workflow-enabled effects (validated)
 
-These are the durable equivalents of Effection's built-in operations. They
-return `Workflow<T>` instead of `Operation<T>`.
+Implemented in `lib/operations.ts`. All four effects (`durableSleep`,
+`durableCall`, `durableAction`, `versionCheck`) are tested through the
+Tier 1-2 test suites.
 
 ### 6.1 durableSleep
 
@@ -591,77 +610,64 @@ the scope's destructor set in `buildScopeInternal`).
 
 ### 8.1 durableSpawn
 
-`durableSpawn` is the workflow-compatible equivalent of `spawn()`. It creates
-a child scope with its own `DurableContext`, runs a child workflow, and
-returns a handle.
+`durableSpawn` is the workflow-compatible equivalent of `spawn()`. It is
+implemented as a single `DurableEffect` whose `enter()` method calls
+`scope.spawn()` — the imperative spawn API available on every Effection
+scope. No infrastructure effects are yielded through the parent workflow's
+iterator.
 
-The question is: does `durableSpawn` itself yield a `DurableEffect`?
+The child workflow runs in its own coroutine with its own iterator. Its
+`DurableEffect` values go directly to the reducer, never through the
+parent's iterator. The parent workflow only sees the single `DurableEffect`
+yielded by `durableSpawn`, which resolves synchronously to a `Task<T>`
+handle.
 
-The spec's examples show no explicit "spawn" event in the journal. Coroutine
-IDs appear in `Yield` and `Close` events, but the spawn point is not
-journaled. Spawns are reconstructed from the deterministic structure of the
-code. This makes sense — since the same code with the same resolution
-sequence always spawns the same children in the same order (§3.2), recording
-spawn events would be redundant.
+Spawn events are not journaled. The spec's examples show no explicit
+"spawn" event — coroutine IDs appear only in `Yield` and `Close` events.
+Spawns are reconstructed from the deterministic structure of the code
+(§3.2). Since the same code with the same resolution sequence always
+spawns the same children in the same order, recording spawn events is
+redundant.
 
-This means `durableSpawn` does its scope management internally using regular
-Effection operations (scope creation, context setup) but its iterator only
-yields `DurableEffect` values to the parent workflow. The child workflow
-is itself a `Workflow<T>`, so it only yields `DurableEffect` values too.
-
-```typescript
-function durableSpawn<T>(op: () => Workflow<T>): Workflow<Task<T>> {
-  return {
-    *[Symbol.iterator]() {
-      let scope = yield* useScope();  // infrastructure — but this is inside
-                                       // the spawn implementation, not in
-                                       // user workflow code
-      // ... create child scope, assign DurableContext, start child ...
-      return task;
-    },
-  };
-}
-```
-
-**Open question:** How does `durableSpawn`'s iterator avoid yielding
-non-durable effects? If `useScope()` is used internally, its `Effect` passes
-through `yield*`. One approach: `durableSpawn` doesn't use `yield*` for
-infrastructure — it accesses scope directly from the routine in `enter()`.
-Another: it's implemented as a `DurableEffect` whose `enter()` method does
-the scope setup. This needs resolution.
+See §12.1 for the full implementation.
 
 ### 8.2 Close event emission
 
 Close events must be written when a coroutine terminates. The natural hook
-is in the scope's `ensure()` callback, which already runs during task
-finalization in `createTask()` (`lib/task.ts`):
+is a `try/finally` block wrapping the child workflow execution inside
+`durableSpawn`:
 
 ```typescript
-// Inside the durable task setup:
-scope.ensure(function* () {
-  let ctx = scope.expect(DurableCtx);
-  let { outcome } = delimiter;
+// Inside the scope.spawn() callback:
+const childScope = yield* useScope();
+childScope.set(DurableCtx, { /* ... */ });
 
-  let closeEvent: Close;
-  if (outcome.exists) {
-    closeEvent = {
-      type: "close",
-      coroutineId: ctx.coroutineId,
-      result: outcome.value.ok
-        ? { status: "ok", value: serialize(outcome.value.value) }
-        : { status: "err", error: serializeError(outcome.value.error) },
-    };
-  } else {
-    closeEvent = {
-      type: "close",
-      coroutineId: ctx.coroutineId,
-      result: { status: "cancelled" },
-    };
-  }
-
-  yield* durableWrite(ctx.stream, closeEvent);
-});
+let result: Result = { status: "cancelled" };
+try {
+  const value = yield* op();
+  result = { status: "ok", value: serialize(value) };
+  return value;
+} catch (error) {
+  result = {
+    status: "err",
+    error: serializeError(error instanceof Error ? error : new Error(String(error))),
+  };
+  throw error;
+} finally {
+  const ctx = childScope.expect(DurableCtx);
+  await ctx.stream.append({
+    type: "close",
+    coroutineId: ctx.coroutineId,
+    result,
+  });
+}
 ```
+
+This handles all three terminal states: normal completion sets `result`
+to ok before `finally`, errors set it to err in `catch` before `finally`,
+and cancellation (where Effection calls `iterator.return()`) leaves the
+default cancelled value. No Effection infrastructure effects (`ensure()`)
+needed — just JavaScript.
 
 ### 8.3 Close events during replay
 
@@ -692,7 +698,11 @@ last Yield event.
 
 ---
 
-## 9. Replay index
+## 9. Replay index (validated)
+
+Implemented in `lib/replay-index.ts` with 21 unit tests (DEC-013).
+Follows the spec §4.1 exactly with no extensions beyond `getCursor()`
+and `yieldCount()` diagnostic accessors.
 
 ### 9.1 Structure
 
@@ -758,7 +768,12 @@ use prototypal inheritance). Each child scope has its own `coroutineId` and
 
 ---
 
-## 10. Entry point: durableRun
+## 10. Entry point: durableRun (validated)
+
+Implemented in `lib/run.ts`. Key implementation details beyond the
+original design: short-circuits on existing Close event (DEC-016),
+checks for early-return divergence after workflow completes, and
+emits Close(err) on exceptions.
 
 The entry point creates a scope, builds the replay index, sets up the
 durable context, and runs the workflow:
@@ -840,49 +855,164 @@ its result is JSON-serializable.
 
 ---
 
-## 12. Open questions
+## 12. Design questions — status
 
-### 12.1 durableSpawn and infrastructure effects
+Most questions from the initial analysis have been resolved through
+implementation. Decisions are recorded in `DECISIONS.md` (18 entries).
+Key validations:
 
-`durableSpawn` needs to create scopes and set contexts, which involves
-infrastructure effects like `useScope()`. If these `yield*` through the
-parent generator, they'd violate the `Workflow` type constraint.
+| Question | Status | Decision |
+|----------|--------|----------|
+| Workflow type constraint | ✅ Resolved | `Generator<DurableEffect<unknown>, T, unknown>` (DEC-009) |
+| DurableEffect ↔ Effect compatibility | ✅ Resolved | Structural match, no casts needed (DEC-010, DEC-015) |
+| routine.scope accessibility | ✅ Resolved | Confirmed in Effection 4.1 alpha source (DEC-012) |
+| Replay/live dispatch location | ✅ Resolved | Inside `enter()`, no reducer changes (DEC-014) |
+| Persist-before-resume strategy | ✅ Resolved | Strategy B — async append + deferred resolve (DEC-017) |
+| Serialization boundary | ✅ Resolved | `T extends Json` type constraint (DEC-018) |
+| DurableStream interface | ✅ Resolved | `readAll()` + `append()`, InMemoryStream for tests |
+| Terminal divergence detection | ✅ Resolved | Both cases implemented with 3 error classes (DEC-008) |
+| durableSpawn implementation | ✅ Resolved | Single DurableEffect, scope management in `enter()` |
+| Batch persistence | ⏳ Deferred | Needed for `all()`/`race()`, not yet in scope |
+| Durable `each()` | ⏳ Future | Design target for long-running consumption |
 
-**Option A:** Implement `durableSpawn` as a single `DurableEffect` whose
-`enter()` method does all scope setup internally (accessing the routine
-and scope directly, not via yielded effects). The spawn itself appears as
-one effect in the workflow's iterator.
+### 12.1 durableSpawn implementation (resolved)
 
-**Option B:** Allow `durableSpawn` to have an internal `Operation`
-implementation that's wrapped in a `Workflow`-compatible shell. The wrapper
-ensures only `DurableEffect` values are yielded to the parent. This might
-require a helper type or a `scoped()` variant.
+`durableSpawn` is a `DurableEffect` whose `enter()` calls `scope.spawn()`
+— the imperative API on every Effection scope for creating concurrent
+child tasks. No generator yielding, no infrastructure effects leaking
+through the parent workflow's iterator.
 
-**Option C:** Make scope creation and context access available as direct
-method calls on the routine/scope (not as yielded effects) so no effects
-need to be yielded at all. `durableSpawn` would call `routine.scope.run()`
-and `scope.set()` directly inside `enter()`.
+From the parent workflow's perspective, `durableSpawn` yields a single
+`DurableEffect` that resolves to a `Task<T>`. The child workflow, being a
+`Workflow<T>` itself, only yields `DurableEffect` values within its own
+coroutine. The two coroutines have independent iterators — the child's
+effects never pass through the parent's iterator.
 
-Option A or C seem cleanest. The spawn doesn't need to appear in the journal
-(§8.1), so there's no reason for it to be a multi-step sequence of yielded
-effects.
+Spawn events are not journaled. The spec's examples confirm this: coroutine
+IDs appear in `Yield` and `Close` events, but there is no "spawn" event in
+the stream. Spawns are reconstructed from the deterministic structure of
+the code (§3.2). Since the same code with the same resolution sequence
+always spawns the same children in the same order, recording spawn events
+would be redundant.
 
-### 12.2 Serialization boundary
+```typescript
+function* durableSpawn<T>(op: () => Workflow<T>): Workflow<Task<T>> {
+  return (yield {
+    description: "durableSpawn",
+    effectDescription: { type: "spawn", name: "spawn" },
 
-The spec requires `Result.value` to be `Json`. This means workflow effect
-results must be JSON-serializable. What about:
+    enter(resolve, routine) {
+      const scope = routine.scope;
+      const parentCtx = scope.expect(DurableCtx);
 
-- **Dates, BigInts, typed arrays?** Need a serialization strategy (e.g.,
-  tagged encoding).
-- **Complex domain objects?** Workflow authors must ensure return values from
-  `durableCall` are serializable, or provide custom serializers.
-- **Error serialization?** The spec defines `SerializedError { message, name?,
-  stack? }`. Custom error properties are lost unless explicitly serialized.
+      // Assign deterministic coroutine ID
+      const childId = `${parentCtx.coroutineId}.${parentCtx.childCounter++}`;
 
-### 12.3 DurableStream interface
+      // scope.spawn() is imperative — no generator, nothing yielded
+      // through the parent's iterator. The child runs concurrently
+      // in its own coroutine.
+      const task = scope.spawn(function* (): Operation<T> {
+        const childScope = yield* useScope();
 
-The spec is intentionally abstract about the stream. The `DurableStream`
-interface needs:
+        // Set up durable context for the child coroutine
+        childScope.set(DurableCtx, {
+          replayIndex: parentCtx.replayIndex,
+          stream: parentCtx.stream,
+          coroutineId: childId,
+          childCounter: 0,
+        });
+
+        // Close event emission via try/finally — no ensure() needed.
+        // Default is cancelled; overwritten on success or error.
+        let result: Result = { status: "cancelled" };
+        try {
+          const value = yield* op();
+          result = { status: "ok", value: serialize(value) };
+          return value;
+        } catch (error) {
+          result = {
+            status: "err",
+            error: serializeError(
+              error instanceof Error ? error : new Error(String(error)),
+            ),
+          };
+          throw error;
+        } finally {
+          const ctx = childScope.expect(DurableCtx);
+          await ctx.stream.append({
+            type: "close",
+            coroutineId: ctx.coroutineId,
+            result,
+          });
+        }
+      });
+
+      // Resolve synchronously with the task handle — the parent can
+      // join on it later. The spawn itself is not journaled.
+      resolve({ ok: true, value: task });
+      return (exit) => exit({ ok: true, value: undefined });
+    },
+  } as DurableEffect<Task<T>>) as Task<T>;
+}
+```
+
+Key details:
+
+- **`scope.spawn()` is imperative.** It's a method on the scope object,
+  not a generator that yields effects. Calling it from inside `enter()`
+  creates a concurrent child coroutine in the reducer without yielding
+  anything through the parent workflow's iterator. This is the same API
+  Effection uses internally.
+
+- **Infrastructure effects are internal.** The `useScope()` call inside
+  the `scope.spawn()` callback is in an `Operation<T>` context (the
+  child's coroutine), not in the parent's `Workflow<T>` context. The
+  parent only sees the single `DurableEffect` that `durableSpawn` yields.
+
+- **Close events via try/finally.** The `result` variable defaults to
+  `cancelled`. Normal completion overwrites it to `ok` before `finally`.
+  Errors overwrite it to `err` in `catch` before `finally`. Cancellation
+  (where Effection calls `iterator.return()`) skips both, leaving the
+  default. No Effection infrastructure effects (`ensure()`) needed —
+  just JavaScript.
+
+- **Resolve is synchronous.** The parent gets the `Task<T>` handle
+  immediately. The child runs concurrently. Joining on the task
+  blocks the parent until the child completes — same as regular Effection.
+
+- **Replay of spawns.** During replay, the parent yields the `durableSpawn`
+  effect. The `enter()` method runs, calls `scope.spawn()`, assigns the
+  same coroutine ID (deterministic counter), and starts the child. The
+  child's `DurableEffect.enter()` calls then individually check the
+  replay index using the child's coroutine ID. The parent and child replay
+  independently, per-coroutine, exactly as the spec describes (§4.3).
+
+- **CoroutineView needs `spawn()`.** The current `CoroutineView` interface
+  only has `get`, `expect`, `set` on `scope`. For `durableSpawn`, it needs
+  `spawn(op: () => Operation<T>): Task<T>` added to the scope shape.
+
+The same pattern applies to `durableAll` and `durableRace` — they are
+`DurableEffect`s whose `enter()` methods call `scope.spawn()` to create
+concurrent children.
+
+### 12.2 Serialization boundary (resolved)
+
+`durableCall<T extends Json>` constrains the return type at compile time
+(DEC-018). Non-serializable values (Dates, BigInts, class instances) are
+rejected by TypeScript. The constraint is intentionally strict — relaxing
+later is easy, tightening would be breaking.
+
+Error serialization is implemented in `lib/serialize.ts` with
+`serializeError()` / `deserializeError()`. Custom error properties beyond
+`message`, `name`, and `stack` are lost — this matches the spec's
+`SerializedError` shape.
+
+Remaining design space: tagged encoding for Dates/BigInts could be added
+as a future `DurableCodec` extension without changing the core protocol.
+
+### 12.3 DurableStream interface (resolved)
+
+Implemented in `lib/stream.ts` with the minimal interface:
 
 ```typescript
 interface DurableStream {
@@ -891,8 +1021,12 @@ interface DurableStream {
 }
 ```
 
-Implementations could be: in-memory array (for testing), file-based WAL,
-database-backed (PGLite?), remote log service.
+`InMemoryStream` implements this for testing, with hooks for tracking
+append counts, injecting failures, and observing append ordering (used
+by the persist-before-resume test). The Durable Streams protocol
+(see `durable-streams.md`) maps cleanly to this interface for production
+use — `append()` maps to an HTTP POST with `await flush()`, and
+`readAll()` maps to a catch-up read from offset `-1`.
 
 ### 12.4 Batch persistence (Strategy C)
 
@@ -902,21 +1036,22 @@ Strategy C suggests batching writes. This could be implemented by having
 `DurableEffect.enter()` enqueue writes to a buffer on the `DurableContext`,
 with the buffer flushed at the end of each reduce cycle.
 
-### 12.5 Terminal divergence detection
+### 12.5 Terminal divergence detection (resolved)
 
-The spec (§6.3) defines two additional divergence cases:
+Both cases from §6.3 are implemented and tested (DEC-008):
 
-1. **Generator finishes early** — returns while replay index has unconsumed
-   entries. This needs detection at the point where the generator's iterator
-   returns `{ done: true }`.
+1. **Generator finishes early.** Detected in `durableRun()` after the
+   workflow returns — if `cursor < totalYields`, throws
+   `EarlyReturnDivergenceError`. Tested in divergence test 9 and 13.
 
-2. **Journal exhausted with Close but generator continues** — the replay
-   index has a Close event but the generator hasn't finished. This needs
-   detection when `peekYield()` returns undefined and `hasClose()` returns
-   true, but the generator yields another effect.
+2. **Generator continues past close.** Detected in
+   `createDurableEffect.enter()` — when `peekYield()` returns undefined
+   but `hasClose()` returns true, throws
+   `ContinuePastCloseDivergenceError`. Tested in divergence test 14.
 
-Both could be checked in `DurableEffect.enter()` (for case 2) and in the
-scope destruction path (for case 1).
+Three distinct error classes share `name = "DivergenceError"` for
+catch-all handling but carry different diagnostic fields for precise
+`instanceof` checks.
 
 ### 12.6 Durable `each()` for long-running consumption
 
@@ -955,29 +1090,43 @@ This is a future concern but worth noting as a design target.
 
 ---
 
-## 14. Proposed next steps
+## 14. Progress and next steps
 
-1. **Validate type system.** Write the `DurableEffect`, `Workflow<T>` types
-   and confirm TypeScript correctly rejects `Operation` usage inside
-   `Workflow` generators.
+### Completed (Tier 1-2)
 
-2. **Implement `createDurableEffect`.** The core factory function with
-   replay/live dispatch inside `enter()`.
+1. ~~Validate type system~~ — `Workflow<T>` rejects `Operation` usage at
+   compile time (DEC-009, `test/types_test.ts`).
+2. ~~Implement `createDurableEffect`~~ — Replay/live dispatch in `enter()`
+   (`lib/effect.ts`).
+3. ~~Implement `ReplayIndex`~~ — Spec-compliant, 21 tests
+   (`lib/replay-index.ts`, `test/replay-index_test.ts`).
+4. ~~Implement workflow effects~~ — `durableSleep`, `durableCall`,
+   `durableAction`, `versionCheck` (`lib/operations.ts`).
+5. ~~Implement `durableRun`~~ — Entry point with in-memory stream
+   (`lib/run.ts`).
+6. ~~Run Tier 1 tests~~ — Golden run, full replay, crash-at-N,
+   persist-before-resume, actor handoff — all passing
+   (`test/durable-run_test.ts`).
+7. ~~Run Tier 2 tests~~ — All divergence detection cases passing
+   (`test/divergence_test.ts`).
 
-3. **Implement `ReplayIndex`.** Standalone class, spec-compliant.
-
-4. **Implement basic workflow effects.** `durableSleep`, `durableCall`,
-   `versionCheck`.
-
-5. **Implement `durableRun`.** Entry point with in-memory stream for testing.
-
-6. **Run spec Tier 1 tests.** Golden run, full replay, crash-at-N, persist-
-   before-resume.
-
-7. **Resolve `durableSpawn`.** Settle on Option A/C from §12.1.
+### Next
 
 8. **Implement `durableSpawn`, `durableAll`, `durableRace`.** Structured
-   concurrency combinators.
+   concurrency combinators. Each is a `DurableEffect` whose `enter()`
+   does scope management internally via `scope.spawn()`.
 
-9. **Run spec Tier 2–4 tests.** Divergence detection, structured concurrency,
-   deterministic identity.
+9. **Run spec Tier 3–4 tests.** Structured concurrency, deterministic
+   identity, cancellation replay.
+
+10. **Durable Streams backend adapter.** Wire `DurableStream` to the
+    Durable Streams protocol (see `durable-streams.md` for mapping).
+
+11. **Batch persistence (Strategy C).** Optimize concurrent child effects
+    by batching writes within a single reduce cycle.
+
+12. **Implement `durableEach`.** Durable iteration primitive for
+    long-running consumption (message queues, event streams). Each
+    iteration checkpoints its position — crash recovery resumes at
+    the next unconsumed item, enabling each loop iteration to run
+    on a different VM. See §12.6.
