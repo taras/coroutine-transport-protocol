@@ -25,6 +25,7 @@ export type {
 
 // ReplayIndex
 export { ReplayIndex } from "./replay-index.ts";
+export type { YieldEntry } from "./replay-index.ts";
 
 // Stream interface
 export type { DurableStream } from "./stream.ts";
@@ -36,3 +37,31 @@ export {
   DivergenceError,
   EarlyReturnDivergenceError,
 } from "./errors.ts";
+
+// Context
+export { DurableCtx } from "./context.ts";
+export type { DurableContext } from "./context.ts";
+
+// Serialization utilities
+export {
+  deserializeError,
+  effectionToProtocol,
+  protocolToEffection,
+  serializeError,
+} from "./serialize.ts";
+
+// Core effect factory
+export { createDurableEffect } from "./effect.ts";
+export type { Executor } from "./effect.ts";
+
+// Workflow-enabled effects
+export {
+  durableAction,
+  durableCall,
+  durableSleep,
+  versionCheck,
+} from "./operations.ts";
+
+// Entry point
+export { durableRun } from "./run.ts";
+export type { DurableRunOptions } from "./run.ts";

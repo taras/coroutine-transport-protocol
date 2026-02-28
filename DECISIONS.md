@@ -238,3 +238,89 @@ Updated before completion of every phase and committed at the end of each phase.
 - **Consequences:** All replay logic depends on this class. It is thoroughly
   tested (21 tests covering empty index, single/multiple yields, close events,
   interleaved coroutines, race scenarios, and spec examples).
+
+## DEC-014: createDurableEffect handles replay/live dispatch inside enter()
+
+- **Phase:** 3 (Durable Runner)
+- **Date:** 2026-02-28
+- **Context:** The protocol requires each durable effect to check the replay
+  index, validate descriptions, and either feed stored results or execute
+  live with persist-before-resume. This logic could live in a central
+  runner/reducer or inside each effect.
+- **Decision:** Each `DurableEffect.enter()` handles its own replay/live
+  dispatch internally, reading `DurableContext` from the scope via
+  `routine.scope.expect(DurableCtx)`.
+- **Rationale:** Keeps the Effection reducer completely untouched. The reducer
+  calls `enter()` on every effect — whether `enter()` resolves synchronously
+  (replay) or asynchronously (live + persist) is invisible to it. This is
+  the architecture from the integration doc §5.1.
+- **Consequences:** No changes to Effection internals. The `createDurableEffect`
+  factory encapsulates all replay/persistence logic. Each workflow-enabled
+  effect (durableSleep, durableCall, etc.) is a thin wrapper over this factory.
+
+## DEC-015: Workflow<T> is directly assignable to Operation<T> — no casts needed
+
+- **Phase:** 3 (Durable Runner)
+- **Date:** 2026-02-28
+- **Context:** `durableRun` calls `scope.run(workflow)` where workflow returns
+  `Workflow<T>` (which is `Generator<DurableEffect<unknown>, T, unknown>`).
+  Need to confirm this is assignable to Effection's `Operation<T>`.
+- **Options considered:**
+  1. Cast `workflow as () => Operation<T>` or use `as any`
+  2. Rely on structural assignability
+- **Decision:** No cast needed. `DurableEffect` extends `Effect` structurally,
+  and TypeScript's covariant yield type means `Generator<DurableEffect, T, unknown>`
+  is assignable to the iterator type that `Operation<T>` expects.
+- **Rationale:** Verified empirically — `scope.run(workflow)` compiles without
+  any type assertions. This confirms the type system design from DEC-009/010.
+- **Consequences:** The type boundary between Workflow and Operation is seamless.
+
+## DEC-016: durableRun short-circuits on existing Close event
+
+- **Phase:** 3 (Durable Runner)
+- **Date:** 2026-02-28
+- **Context:** When `durableRun` is called with a stream that already contains
+  a Close event for the root coroutine, should it re-run the workflow or
+  return the stored result directly?
+- **Decision:** Short-circuit. If `replayIndex.hasClose(coroutineId)` is true,
+  return the stored result from the Close event without creating a scope or
+  running the workflow.
+- **Rationale:** A Close event means the workflow completed in a previous run.
+  Re-running it would be wasteful and could produce unexpected behavior
+  (e.g., side effects from live effects). The stored result is the canonical
+  outcome.
+- **Consequences:** Fully-completed workflows return instantly. The early-return
+  check uses `hasClose()` (not `isFullyReplayed()`, which requires cursor
+  advancement that hasn't happened yet).
+
+## DEC-017: Persist-before-resume via Strategy B (async append + deferred resolve)
+
+- **Phase:** 3 (Durable Runner)
+- **Date:** 2026-02-28
+- **Context:** The spec §5 defines the persist-before-resume invariant with
+  three strategies. Need to choose one for the Effection integration.
+- **Decision:** Strategy B — the effect's `enter()` calls `stream.append(event)`
+  and places `resolve()` inside the `.then()` callback. The generator does
+  not advance until the durable write completes.
+- **Rationale:** This is the natural fit for Effection's async resolve model.
+  The reducer waits for `resolve()` to be called, so deferring it until after
+  the append guarantees persist-before-resume. Verified by the ordering test
+  (execute → persist → resume for each step).
+- **Consequences:** Live execution has one async hop per effect (the stream
+  append). During replay, `resolve()` is called synchronously — zero async
+  overhead.
+
+## DEC-018: durableCall constrains T extends Json for serializability
+
+- **Phase:** 3 (Durable Runner)
+- **Date:** 2026-02-28
+- **Context:** `durableCall<T>(name, fn)` stores the function's return value
+  in the journal. The value must be JSON-serializable per the protocol.
+- **Decision:** Constrain `T extends Json` at the type level.
+- **Rationale:** Catches non-serializable return values at compile time rather
+  than silently producing corrupt journal entries. The `Json` type from
+  `types.ts` covers all JSON-serializable values.
+- **Consequences:** Users must ensure their async functions return JSON-compatible
+  values. Complex objects (Dates, class instances) need explicit serialization.
+  The constraint is intentionally strict — relaxing it later is easy, but
+  tightening it would be a breaking change.
