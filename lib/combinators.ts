@@ -65,6 +65,12 @@ function* runDurableChild<T extends Json | void>(
       // normal structured concurrency teardown, just like the original
       // run. The Close(cancelled) event already exists in the journal,
       // so we skip re-emitting it (the finally block checks for this).
+      //
+      // INVARIANT: This branch is only reachable when a parent combinator
+      // (durableRace or durableAll with a failed sibling) will cancel this
+      // child. Close(cancelled) in the journal means the child was
+      // previously cancelled by structured concurrency, so on replay the
+      // same combinator will cancel it again. This cannot deadlock.
       yield* suspend();
       // unreachable — suspend blocks until cancelled
       return undefined as T;
@@ -175,7 +181,7 @@ export function* durableSpawn<T extends Json | void>(
  * Each child emits a Close event on termination.
  *
  * If any child fails, remaining children are cancelled (fail-fast,
- * Effection's default structured concurrency behavior via scoped()).
+ * Effection's default structured concurrency behavior via all()).
  *
  * Returns an array of results in the same order as the input workflows.
  *

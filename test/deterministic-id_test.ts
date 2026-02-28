@@ -6,7 +6,7 @@
  * and that the structured concurrency combinators produce consistent IDs.
  */
 
-import { assertEquals, assertRejects } from "@std/assert";
+import { assertEquals } from "@std/assert";
 import {
   durableAll,
   durableCall,
@@ -15,7 +15,6 @@ import {
   InMemoryStream,
   type DurableEvent,
   type Json,
-  type Workflow,
 } from "../lib/mod.ts";
 
 // ---------------------------------------------------------------------------
@@ -115,7 +114,6 @@ Deno.test("deterministic IDs: live run and replay produce identical coroutine ID
 
   const liveEvents = await stream.readAll();
   const liveIds = coroutineIds(liveEvents);
-  const liveTrace = eventTrace(liveEvents);
 
   // Replay run — same stream, no effects should execute
   const replayStream = new InMemoryStream(liveEvents);

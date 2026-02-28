@@ -517,7 +517,7 @@ Deno.test("race: full replay — returns stored result without re-executing", as
     function* () {
       return yield* durableRace([
         function* () {
-          const a = yield* durableCall("winA", tracker2.fn("winA", "WRONG"));
+          yield* durableCall("winA", tracker2.fn("winA", "WRONG"));
           return yield* durableCall("winB", tracker2.fn("winB", "WRONG"));
         },
         function* () {
