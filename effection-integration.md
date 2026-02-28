@@ -1,6 +1,6 @@
 # Durable Execution for Effection: Architecture Research
 
-**Status:** Validated through implementation — Tier 1-2 tests passing
+**Status:** Validated through implementation — Tier 1-4 tests passing
 **Audience:** Charles, Taras
 **Inputs:** Two-event durable execution spec (v2), Effection source (lib/), AGENTS.md, Charles's type-constraint feedback, implementation + DECISIONS.md
 
@@ -11,8 +11,9 @@
 This document maps the two-event durable execution protocol onto Effection's
 runtime architecture and incorporates Charles's insight that **type-level
 constraints** should replace runtime effect classification. The design has
-been **validated through implementation** — Tier 1 (core replay) and Tier 2
-(divergence detection) tests are passing. Key conclusions:
+been **validated through implementation** — all four tiers of tests pass:
+core replay (Tier 1), divergence detection (Tier 2), structured concurrency
+(Tier 3), and deterministic identity (Tier 4). Key conclusions:
 
 - Effection's reducer does not need to change.
 - Durability is implemented entirely within a new `DurableEffect` type whose
@@ -20,15 +21,20 @@ been **validated through implementation** — Tier 1 (core replay) and Tier 2
 - A `Workflow<T>` type constrains generators at compile time so that only
   durable-safe effects can be yielded. All `Workflow`s are `Operation`s, but
   not all `Operation`s are `Workflow`s. No casts needed at the boundary (DEC-015).
-- Scope management (coroutine IDs, Close events) is layered via Effection's
-  existing `Context` and `Api.around()` systems.
+- Structured concurrency combinators (`durableSpawn`, `durableAll`,
+  `durableRace`) are `Operation` generators that delegate to Effection's
+  native `spawn()`, `all()`, `race()`. A shared `runDurableChild` helper
+  handles DurableContext setup, Close events, and the `suspend()` trick
+  for replaying cancelled children.
 - The Durable Streams protocol provides a strong backend fit (see companion
   document `durable-streams.md`).
 
-**Implementation artifacts:** `lib/` contains 8 modules (types, replay-index,
-effect, operations, run, context, stream, serialize). `test/` contains 4 test
-files with 40+ tests across types, replay-index, durable-run (Tier 1), and
-divergence (Tier 2). 18 architectural decisions recorded in `DECISIONS.md`.
+**Implementation artifacts:** `lib/` contains 9 modules (types, replay-index,
+effect, operations, combinators, run, context, stream, serialize) plus
+`mod.ts` as the public API barrel. `test/` contains 6 test files with 50+
+tests across types, replay-index, durable-run (Tier 1), divergence (Tier 2),
+structured-concurrency (Tier 3), and deterministic-id (Tier 4). 18
+architectural decisions recorded in `DECISIONS.md`.
 
 ---
 
@@ -222,7 +228,10 @@ effects regardless of call depth.
    - Propagates errors to the parent boundary
 5. Creates a coroutine and returns a `start()` function
 
-The ensure callback is the natural hook for emitting Close events.
+The ensure callback provides a natural lifecycle hook, but the durable
+execution implementation uses try/catch/finally in `runDurableChild`
+instead (see §8.1). This avoids introducing infrastructure effects into
+the child's generator — try/finally is just JavaScript.
 
 ---
 
@@ -251,15 +260,25 @@ Instead of classifying effects after they're yielded, constrain what can be
 yielded at the type level:
 
 ```typescript
-interface DurableEffect<T> extends Effect<T> {
+interface DurableEffect<T> {
+  description: string;
   effectDescription: EffectDescription;  // { type, name }
+  enter(
+    resolve: Resolve<EffectionResult<T>>,
+    routine: CoroutineView,
+  ): (resolve: Resolve<EffectionResult<void>>) => void;
 }
 
-type Workflow<T> = Iterable<DurableEffect<unknown>, T, unknown>;
+type Workflow<T> = Generator<DurableEffect<unknown>, T, unknown>;
 ```
 
+`DurableEffect<T>` is structurally compatible with `Effect<T>` (same shape plus
+the extra `effectDescription` field). `Workflow` uses `Generator` (not `Iterable`)
+so TypeScript enforces the yield-type constraint at compile time — yielding a
+plain `Effect` inside a `Workflow` generator is a type error.
+
 Key relationships:
-- `DurableEffect extends Effect` → every `DurableEffect` is an `Effect`
+- `DurableEffect` is structurally compatible with `Effect` → assignable to `Effect<T>`
 - `Workflow` yields `DurableEffect` → every `Workflow` is an `Operation`
 - `Operation` yields `Effect` → `Operation` is NOT a `Workflow`
 - The reducer processes both identically (it just calls `enter()`)
@@ -290,6 +309,15 @@ by calling `enter()`, getting a teardown function, and waiting for `resolve()`.
 If it compiles, it's durable. There's no hidden gotcha where "this operation
 looks safe but actually breaks replay."
 
+**Practical nuance: Workflow vs Operation at the top level.** The `Workflow<T>`
+annotation is strictest for leaf-level generators that yield only
+`DurableEffect` values. Generators that use combinators (`durableAll`,
+`durableRace`, `durableSpawn`) are typed as `Operation<T>` because the
+combinators use infrastructure effects internally. `durableRun` accepts
+`Workflow<T> | Operation<T>` to accommodate both. The safety guarantee still
+holds: combinators only accept durable child workflows, so the constraint
+pushes down to the children where it matters most.
+
 ### 4.4 The freeing quality
 
 Charles's observation: workflow authors don't need to understand whether they're
@@ -317,77 +345,103 @@ interface DurableContext {
   replayIndex: ReplayIndex;
   stream: DurableStream;
   coroutineId: CoroutineId;
+  childCounter: number;
 }
 
 const DurableCtx = createContext<DurableContext>("@effection/durable");
 
+type Executor = (
+  resolve: (result: Result) => void,
+  reject: (error: Error) => void,
+) => () => void;
+
 function createDurableEffect<T>(
   desc: EffectDescription,
-  execute: (
-    resolve: (result: Result<T>) => void,
-    reject: (error: Error) => void,
-  ) => () => void,
+  execute: Executor,
 ): DurableEffect<T> {
   return {
     description: `${desc.type}(${desc.name})`,
     effectDescription: desc,
     enter(resolve, routine) {
-      let scope = routine.scope;
-      let ctx = scope.expect(DurableCtx);
-      let entry = ctx.replayIndex.peekYield(ctx.coroutineId);
+      const ctx = routine.scope.expect<DurableContext>(DurableCtx);
+      const entry = ctx.replayIndex.peekYield(ctx.coroutineId);
 
       if (entry) {
         // ── REPLAY PATH ──
-        // Validate description match (§6)
+        // §6.2: Validate description match
         if (entry.description.type !== desc.type ||
             entry.description.name !== desc.name) {
-          let cursor = ctx.replayIndex.getCursor(ctx.coroutineId);
-          resolve(Err(new DivergenceError(
-            ctx.coroutineId, cursor, entry.description, desc
-          )));
-          return (exit) => exit(Ok());
+          const cursor = ctx.replayIndex.getCursor(ctx.coroutineId);
+          resolve({
+            ok: false,
+            error: new DivergenceError(
+              ctx.coroutineId, cursor, entry.description, desc
+            ),
+          });
+          return (exit) => exit(VOID_OK);
         }
 
         ctx.replayIndex.consumeYield(ctx.coroutineId);
 
-        // Feed stored result synchronously — no I/O, no side effects
-        resolve(entry.result);
-        return (exit) => exit(Ok());
+        // Feed stored result synchronously — no I/O, no side effects.
+        // Convert from protocol Result to Effection Result.
+        resolve(protocolToEffection<T>(entry.result));
+        return (exit) => exit(VOID_OK);
+      }
 
-      } else {
-        // ── LIVE PATH ──
-        let teardown = execute(
-          (result) => {
-            // PERSIST BEFORE RESUME (§5)
-            let event: Yield = {
-              type: "yield",
-              coroutineId: ctx.coroutineId,
-              description: desc,
-              result,
-            };
-            ctx.stream.append(event).then(() => {
-              resolve(result);  // resume generator only after durable write
-            });
-          },
+      // No replay entry. Check for continue-past-close divergence (§6.3).
+      if (ctx.replayIndex.hasClose(ctx.coroutineId)) {
+        resolve({
+          ok: false,
+          error: new ContinuePastCloseDivergenceError(
+            ctx.coroutineId,
+            ctx.replayIndex.yieldCount(ctx.coroutineId),
+          ),
+        });
+        return (exit) => exit(VOID_OK);
+      }
+
+      // ── LIVE PATH ──
+
+      function persistAndResolve(result: Result): void {
+        const event: Yield = {
+          type: "yield",
+          coroutineId: ctx.coroutineId,
+          description: desc,
+          result,
+        };
+        // Strategy B: buffered write with deferred resume.
+        ctx.stream.append(event).then(
+          () => resolve(protocolToEffection<T>(result)),
+          (err) => resolve({
+            ok: false,
+            error: err instanceof Error ? err : new Error(String(err)),
+          }),
+        );
+      }
+
+      // Guard against synchronous throws from the executor
+      let teardown: () => void;
+      try {
+        teardown = execute(
+          (result) => persistAndResolve(result),
           (error) => {
-            let result: Result<T> = { status: "err", error: serialize(error) };
-            let event: Yield = {
-              type: "yield",
-              coroutineId: ctx.coroutineId,
-              description: desc,
-              result,
-            };
-            ctx.stream.append(event).then(() => {
-              resolve(result);
+            persistAndResolve({
+              status: "err",
+              error: serializeError(error),
             });
           },
         );
-
-        return (exit) => {
-          try { teardown(); exit(Ok()); }
-          catch (e) { exit(Err(e as Error)); }
-        };
+      } catch (e) {
+        const error = e instanceof Error ? e : new Error(String(e));
+        persistAndResolve({ status: "err", error: serializeError(error) });
+        return (exit) => exit(VOID_OK);
       }
+
+      return (exit) => {
+        try { teardown(); exit(VOID_OK); }
+        catch (e) { exit({ ok: false, error: e as Error }); }
+      };
     },
   };
 }
@@ -398,17 +452,29 @@ function createDurableEffect<T>(
 **Persist-before-resume (§5, hard invariant).** During live execution,
 `resolve()` is called inside the `.then()` callback of the stream append.
 The generator does not advance until the durable write completes. This is
-the spec's "Strategy B: buffered write with deferred resume."
+the spec's "Strategy B: buffered write with deferred resume." If the
+append rejects, the error is delivered through Effection's normal error
+channel to avoid hanging the generator.
 
 **Transparency (§4.3).** During replay, `resolve()` is called synchronously
-with the stored result. The reducer processes it in the same tick. The
-generator receives the same value via the same `iterator.next()` call
-path. It cannot distinguish replay from live.
+with the stored result (converted via `protocolToEffection()`). The reducer
+processes it in the same tick. The generator receives the same value via
+the same `iterator.next()` call path. It cannot distinguish replay from live.
 
 **Divergence detection (§6).** The description comparison happens inside
 `enter()` before the stored result is fed. A mismatch raises
 `DivergenceError` through the normal error propagation path (via
-`resolve(Err(...))`).
+`resolve({ ok: false, error: ... })`). Additionally, the continue-past-close
+check detects when the journal has a Close for this coroutine but the
+generator yields additional effects beyond what was recorded.
+
+**Result conversion.** The protocol uses `{ status: "ok" | "err" | "cancelled" }`
+while Effection uses `{ ok: true, value } | { ok: false, error }`. The
+`protocolToEffection()` helper bridges this gap in both replay and live paths.
+
+**Synchronous throw guard.** If the executor throws synchronously (before
+returning a teardown function), the error is caught, serialized, and
+persisted through the normal `persistAndResolve` path.
 
 **No reducer changes.** The reducer calls `enter()`, gets a teardown,
 waits for `resolve()`. Whether `resolve()` fires synchronously (replay)
@@ -438,89 +504,81 @@ Tier 1-2 test suites.
 ### 6.1 durableSleep
 
 ```typescript
-function durableSleep(ms: number): Workflow<void> {
-  return {
-    *[Symbol.iterator]() {
-      return (yield createDurableEffect(
-        { type: "sleep", name: "sleep" },
-        (resolve) => {
-          let id = setTimeout(() => resolve({ status: "ok" }), ms);
-          return () => clearTimeout(id);
-        },
-      )) as void;
+function* durableSleep(ms: number): Workflow<void> {
+  yield createDurableEffect<void>(
+    { type: "sleep", name: "sleep" },
+    (resolve) => {
+      const id = setTimeout(() => resolve({ status: "ok" }), ms);
+      return () => clearTimeout(id);
     },
-  };
+  );
 }
 ```
 
 ### 6.2 durableCall
 
 ```typescript
-function durableCall<T>(
+function* durableCall<T extends Json>(
   name: string,
   fn: () => Promise<T>,
 ): Workflow<T> {
-  return {
-    *[Symbol.iterator]() {
-      return (yield createDurableEffect(
-        { type: "call", name },
-        (resolve, reject) => {
-          fn().then(
-            (value) => resolve({ status: "ok", value: serialize(value) }),
-            (error) => reject(error as Error),
-          );
-          return () => {};
+  return (yield createDurableEffect<T>(
+    { type: "call", name },
+    (resolve) => {
+      fn().then(
+        (value) => resolve({ status: "ok", value: value as Json }),
+        (error) => {
+          resolve({
+            status: "err",
+            error: serializeError(
+              error instanceof Error ? error : new Error(String(error)),
+            ),
+          });
         },
-      )) as T;
+      );
+      return () => {};
     },
-  };
+  )) as T;
 }
 ```
 
 ### 6.3 durableAction
 
 ```typescript
-function durableAction<T>(
+function* durableAction<T extends Json>(
   name: string,
   executor: (
     resolve: (value: T) => void,
     reject: (error: Error) => void,
   ) => () => void,
 ): Workflow<T> {
-  return {
-    *[Symbol.iterator]() {
-      return (yield createDurableEffect(
-        { type: "action", name },
-        (resolve, reject) => {
-          return executor(
-            (value) => resolve({ status: "ok", value: serialize(value) }),
-            reject,
-          );
-        },
-      )) as T;
+  return (yield createDurableEffect<T>(
+    { type: "action", name },
+    (protocolResolve, reject) => {
+      return executor(
+        (value: T) =>
+          protocolResolve({ status: "ok", value: value as Json }),
+        reject,
+      );
     },
-  };
+  )) as T;
 }
 ```
 
 ### 6.4 versionGate (§9)
 
 ```typescript
-function versionCheck(
+function* versionCheck(
   name: string,
   opts: { minVersion: number; maxVersion: number },
 ): Workflow<number> {
-  return {
-    *[Symbol.iterator]() {
-      return (yield createDurableEffect(
-        { type: "version_gate", name },
-        (resolve) => {
-          resolve({ status: "ok", value: opts.maxVersion });
-          return () => {};
-        },
-      )) as number;
+  return (yield createDurableEffect<number>(
+    { type: "version_gate", name },
+    (resolve) => {
+      resolve({ status: "ok", value: opts.maxVersion });
+      return () => {};
     },
-  };
+  )) as number;
 }
 ```
 
@@ -543,7 +601,7 @@ function* orderWorkflow(orderId: string): Workflow<void> {
 
 ---
 
-## 7. Coroutine identity
+## 7. Coroutine identity (validated)
 
 ### 7.1 Per-parent counter scheme (§3)
 
@@ -606,95 +664,216 @@ the scope's destructor set in `buildScopeInternal`).
 
 ---
 
-## 8. Scope management: spawn, join, Close events
+## 8. Scope management: spawn, join, Close events (validated)
 
-### 8.1 durableSpawn
+Implemented in `lib/combinators.ts`. The actual architecture differs from
+earlier sketches — combinators are `Operation` generators (not `DurableEffect`s),
+and they delegate to Effection's native `spawn()`, `all()`, and `race()`.
 
-`durableSpawn` is the workflow-compatible equivalent of `spawn()`. It is
-implemented as a single `DurableEffect` whose `enter()` method calls
-`scope.spawn()` — the imperative spawn API available on every Effection
-scope. No infrastructure effects are yielded through the parent workflow's
-iterator.
+### 8.1 runDurableChild — the core building block
 
-The child workflow runs in its own coroutine with its own iterator. Its
-`DurableEffect` values go directly to the reducer, never through the
-parent's iterator. The parent workflow only sees the single `DurableEffect`
-yielded by `durableSpawn`, which resolves synchronously to a `Task<T>`
-handle.
-
-Spawn events are not journaled. The spec's examples show no explicit
-"spawn" event — coroutine IDs appear only in `Yield` and `Close` events.
-Spawns are reconstructed from the deterministic structure of the code
-(§3.2). Since the same code with the same resolution sequence always
-spawns the same children in the same order, recording spawn events is
-redundant.
-
-See §12.1 for the full implementation.
-
-### 8.2 Close event emission
-
-Close events must be written when a coroutine terminates. The natural hook
-is a `try/finally` block wrapping the child workflow execution inside
-`durableSpawn`:
+All three combinators share a single helper, `runDurableChild()`, that
+wraps any child workflow with DurableContext setup and Close event handling.
+This is an `Operation<T>` meant to run inside a `spawn()`:
 
 ```typescript
-// Inside the scope.spawn() callback:
-const childScope = yield* useScope();
-childScope.set(DurableCtx, { /* ... */ });
+function* runDurableChild<T extends Json | void>(
+  childWorkflow: () => Workflow<T> | Operation<T>,
+  childId: string,
+  parentCtx: DurableContext,
+): Operation<T> {
+  const { replayIndex, stream } = parentCtx;
 
-let result: Result = { status: "cancelled" };
-try {
-  const value = yield* op();
-  result = { status: "ok", value: serialize(value) };
-  return value;
-} catch (error) {
-  result = {
-    status: "err",
-    error: serializeError(error instanceof Error ? error : new Error(String(error))),
-  };
-  throw error;
-} finally {
-  const ctx = childScope.expect(DurableCtx);
-  await ctx.stream.append({
-    type: "close",
-    coroutineId: ctx.coroutineId,
-    result,
+  // Short-circuit: child already completed in a previous run
+  if (replayIndex.hasClose(childId)) {
+    const closeEvent = replayIndex.getClose(childId)!;
+    if (closeEvent.result.status === "ok") {
+      return closeEvent.result.value as T;
+    } else if (closeEvent.result.status === "err") {
+      throw deserializeError(closeEvent.result.error);
+    } else {
+      // Cancelled in previous run — suspend until parent cancels us
+      yield* suspend();
+      return undefined as T;  // unreachable
+    }
+  }
+
+  // Set child's DurableContext
+  const scope = yield* useScope();
+  scope.set(DurableCtx, {
+    replayIndex, stream,
+    coroutineId: childId,
+    childCounter: 0,
   });
+
+  let closeEvent: Close | undefined;
+  try {
+    const result: T = yield* childWorkflow();
+    closeEvent = {
+      type: "close", coroutineId: childId,
+      result: { status: "ok", value: result as Json },
+    };
+    return result;
+  } catch (error) {
+    closeEvent = {
+      type: "close", coroutineId: childId,
+      result: {
+        status: "err",
+        error: serializeError(
+          error instanceof Error ? error : new Error(String(error)),
+        ),
+      },
+    };
+    throw error;
+  } finally {
+    if (!closeEvent) {
+      closeEvent = {
+        type: "close", coroutineId: childId,
+        result: { status: "cancelled" },
+      };
+    }
+    // Don't re-emit if journal already has this Close
+    if (!replayIndex.hasClose(childId)) {
+      yield* call(() => stream.append(closeEvent!));
+    }
+  }
 }
 ```
 
-This handles all three terminal states: normal completion sets `result`
-to ok before `finally`, errors set it to err in `catch` before `finally`,
-and cancellation (where Effection calls `iterator.return()`) leaves the
-default cancelled value. No Effection infrastructure effects (`ensure()`)
-needed — just JavaScript.
+Key design decisions in this helper:
 
-### 8.3 Close events during replay
+**Short-circuit on existing Close.** If the journal already has a Close for
+this child, `runDurableChild` never runs the workflow. For `ok` and `err`,
+it returns/throws immediately. For `cancelled`, it uses `yield* suspend()`
+(see §8.4).
 
-When the replay index has a `Close` event for a coroutine, there are two
-cases:
+**Close events via try/catch/finally.** The `closeEvent` variable starts
+undefined. Normal completion sets it in the try block. Errors set it in
+catch. If both are skipped (cancellation via `iterator.return()`), it
+stays undefined and finally assigns `cancelled`. This covers all three
+terminal states with plain JavaScript.
 
-1. **Fully replayed (all yields consumed + Close exists).** The child's
-   result can be read directly from the Close event. The runtime may
-   optionally skip re-instantiating the generator entirely if the parent
-   only needs the return value.
+**No re-emission guard.** The `if (!replayIndex.hasClose(childId))` check
+in finally prevents writing a duplicate Close when replaying a child that
+was already completed. Without this, a fully-replayed child that short-
+circuits would emit a second Close event.
 
-2. **Partially replayed (some yields consumed, no Close).** The child
-   replays its recorded yields, then transitions to live execution for
-   remaining effects. This is the per-coroutine replay-to-live transition
-   (§4.3).
+**`yield* call()` for stream append.** The finally block uses Effection's
+`call()` to await the stream append within generator context, rather than
+raw `await`. This keeps the code within Effection's structured concurrency
+model.
 
-### 8.4 Cancellation during replay
+### 8.2 durableSpawn
 
-When the replay index has `Close(cancelled)` for a coroutine, the runtime
-must call `iterator.return()` on that coroutine's generator after its last
-recorded yield has been replayed. If the generator yields effects during
-cleanup (`finally` blocks), those effects are replayed from the journal too.
+Spawns a single durable child. Returns `Operation<Task<T>>` (not
+`Workflow<Task<T>>`) because it uses infrastructure effects internally:
 
-The trigger for cancellation during replay is the `Close(cancelled)` event
-in the journal, not a live cancellation signal. The cancellation point is
-determined by the position of the Close event relative to the coroutine's
-last Yield event.
+```typescript
+function* durableSpawn<T extends Json | void>(
+  childWorkflow: () => Workflow<T> | Operation<T>,
+): Operation<Task<T>> {
+  const scope = yield* useScope();
+  const ctx = scope.expect<DurableContext>(DurableCtx);
+  const childId = `${ctx.coroutineId}.${ctx.childCounter++}`;
+  return yield* spawn(() => runDurableChild(childWorkflow, childId, ctx));
+}
+```
+
+Uses Effection's `spawn()` directly via `yield*`. The child runs
+concurrently in its own scope. `runDurableChild` handles DurableContext
+setup and Close events.
+
+### 8.3 durableAll
+
+Fork/join — runs all children concurrently, waits for all to complete:
+
+```typescript
+function* durableAll<T extends Json | void>(
+  workflows: (() => Workflow<T> | Operation<T>)[],
+): Operation<T[]> {
+  const scope = yield* useScope();
+  const ctx = scope.expect<DurableContext>(DurableCtx);
+
+  const childOps: Operation<T>[] = workflows.map((workflow) => {
+    const childId = `${ctx.coroutineId}.${ctx.childCounter++}`;
+    return {
+      *[Symbol.iterator]() {
+        return yield* runDurableChild(workflow, childId, ctx);
+      },
+    };
+  });
+
+  return yield* effectionAll(childOps);
+}
+```
+
+Delegates to Effection's native `all()`, which provides error isolation
+via `trap()` internally. When any child fails, remaining siblings are
+cancelled — Effection handles this, and `runDurableChild`'s finally block
+emits `Close(cancelled)` for each.
+
+### 8.4 Cancellation replay via suspend()
+
+When replaying a child that was cancelled in a previous run (journal has
+`Close(cancelled)`), the child cannot simply throw or return — that would
+change the control flow the parent combinator sees. Instead, `runDurableChild`
+calls `yield* suspend()`, which blocks the child forever.
+
+This works because the parent combinator (`durableRace` or `durableAll`
+with a failed sibling) will cancel this child as part of normal structured
+concurrency teardown — the same thing that happened in the original run.
+The `suspend()` just holds the child alive until that cancellation arrives.
+
+The `Close(cancelled)` event already exists in the journal, so the finally
+block's `if (!replayIndex.hasClose(childId))` guard skips re-emission.
+
+This is the only correct approach: it makes replay indistinguishable from
+live execution from the parent's perspective. The parent's race/all sees
+exactly the same behavior — one child completes, the others get cancelled.
+
+### 8.5 durableRace
+
+First child to complete wins, others cancelled:
+
+```typescript
+function* durableRace<T extends Json | void>(
+  workflows: (() => Workflow<T> | Operation<T>)[],
+): Operation<T> {
+  const scope = yield* useScope();
+  const ctx = scope.expect<DurableContext>(DurableCtx);
+
+  const childOps: Operation<T>[] = workflows.map((workflow) => {
+    const childId = `${ctx.coroutineId}.${ctx.childCounter++}`;
+    return {
+      *[Symbol.iterator]() {
+        return yield* runDurableChild(workflow, childId, ctx);
+      },
+    };
+  });
+
+  return yield* effectionRace(childOps);
+}
+```
+
+Uses Effection's native `race()`, which spawns all children and returns
+the first to complete, cancelling the rest. During replay, the winner
+short-circuits from its stored Close(ok), the losers short-circuit into
+suspend() from their stored Close(cancelled), and Effection's race cancels
+the suspended losers — identical to the original run.
+
+### 8.6 Close event ordering
+
+Causal ordering is enforced naturally by the control flow:
+
+1. Child completes → `runDurableChild` appends Close in finally
+2. Child Close is awaited via `yield* call()`
+3. Parent resumes only after the child's generator finishes (Effection's
+   scope lifetime guarantee)
+4. Parent's subsequent Yield events are appended after all child Closes
+
+For `durableAll`: all child Closes precede the parent's post-join effects.
+For `durableRace`: winner's Close precedes losers' Close(cancelled), all
+precede the parent's next effect.
 
 ---
 
@@ -756,6 +935,10 @@ class ReplayIndex {
   isFullyReplayed(id: CoroutineId): boolean {
     return this.peekYield(id) === undefined && this.hasClose(id);
   }
+
+  yieldCount(id: CoroutineId): number {
+    return this.yields.get(id)?.length ?? 0;
+  }
 }
 ```
 
@@ -781,66 +964,118 @@ durable context, and runs the workflow:
 ```typescript
 interface DurableRunOptions {
   stream: DurableStream;
+  coroutineId?: string;
 }
 
-async function durableRun<T>(
-  workflow: () => Workflow<T>,
+async function durableRun<T extends Json | void>(
+  workflow: () => Workflow<T> | Operation<T>,
   options: DurableRunOptions,
 ): Promise<T> {
-  let events = await options.stream.readAll();
-  let replayIndex = new ReplayIndex(events);
+  const { stream, coroutineId = "root" } = options;
+  const events = await stream.readAll();
+  const replayIndex = new ReplayIndex(events);
 
-  let [scope, destroy] = createScope();
+  // Short-circuit: root already completed in a previous run
+  if (replayIndex.hasClose(coroutineId)) {
+    const closeEvent = replayIndex.getClose(coroutineId)!;
+    if (closeEvent.result.status === "ok") return closeEvent.result.value as T;
+    if (closeEvent.result.status === "err") throw deserializeError(closeEvent.result.error);
+    throw new Error("Workflow was cancelled");
+  }
 
-  scope.set(DurableCtx, {
-    replayIndex,
-    stream: options.stream,
-    coroutineId: "root",
-    childCounter: 0,
-  });
-
-  // Install Close event emission on scope destruction
-  // (via Api.around or ensure)
+  const [scope, destroy] = createScope();
+  scope.set(DurableCtx, { replayIndex, stream, coroutineId, childCounter: 0 });
 
   try {
-    let task = scope.run(workflow as () => Operation<T>);
-    return await task;
+    // Workflow<T> is structurally assignable to Operation<T> — no cast needed
+    const task = scope.run(workflow);
+    const result = await task;
+
+    // §6.3: Check for early return divergence
+    const cursor = replayIndex.getCursor(coroutineId);
+    const totalYields = replayIndex.yieldCount(coroutineId);
+    if (cursor < totalYields) {
+      throw new EarlyReturnDivergenceError(coroutineId, cursor, totalYields);
+    }
+
+    await stream.append({
+      type: "close", coroutineId,
+      result: { status: "ok", value: result as Json },
+    });
+    return result;
+  } catch (error) {
+    await stream.append({
+      type: "close", coroutineId,
+      result: { status: "err", error: serializeError(error) },
+    });
+    throw error;
   } finally {
-    await destroy();
+    try { await destroy(); } catch { /* swallow scope cleanup errors */ }
   }
 }
 ```
 
-Because `Workflow<T>` satisfies `Operation<T>`, it can be passed to
-`scope.run()` without casting issues at the runtime level. The cast
-`as () => Operation<T>` is needed only because TypeScript's inference
-for generator return types needs guidance.
+Key details:
+
+- **Short-circuit on existing Close.** If the journal already has a Close
+  for the root coroutine, the workflow completed in a previous run. Return
+  the stored result directly without creating a scope or running the
+  workflow. This is why full-replay tests show zero effect executions and
+  zero appends.
+
+- **`Workflow<T> | Operation<T>` union.** Accepts either type. This is
+  pragmatic — combinators are Operations, not Workflows, so a workflow
+  that's just `durableAll(...)` would be an Operation. Structural
+  compatibility means no cast is needed at the `scope.run()` call site.
+
+- **Early return divergence check.** After the workflow returns, checks
+  if the replay index has unconsumed yields. If so, the generator finished
+  before replaying all journal entries — the code has changed (§6.3).
+
+- **Swallowing destroy errors.** If the workflow threw, `destroy()` may
+  also throw "halted". The `try { await destroy() } catch {}` in finally
+  prevents masking the original error.
 
 ---
 
-## 11. What can and cannot be used in workflows
+## 11. What can and cannot be used in workflows (validated)
 
-### 11.1 Allowed (compiles)
+### 11.1 Two categories of durable operations
 
-| Workflow effect | Equivalent Effection operation |
-|----------------|-------------------------------|
+**Leaf effects** return `Workflow<T>` — they yield a single `DurableEffect`
+and are the atomic units of durable execution:
+
+| Leaf effect | Equivalent Effection operation |
+|-------------|-------------------------------|
 | `durableSleep(ms)` | `sleep(ms)` |
 | `durableCall(name, fn)` | `call(fn)` |
 | `durableAction(name, executor)` | `action(executor)` |
 | `versionCheck(name, opts)` | (new, no equivalent) |
+
+**Combinators** return `Operation<T>` — they use infrastructure effects
+internally (`useScope`, `spawn`) and delegate to Effection's native
+structured concurrency primitives:
+
+| Combinator | Equivalent Effection operation |
+|------------|-------------------------------|
 | `durableSpawn(workflow)` | `spawn(operation)` |
 | `durableAll([...workflows])` | `all([...operations])` |
 | `durableRace([...workflows])` | `race([...operations])` |
+
+Combinators return `Operation<T>` rather than `Workflow<T>`, so top-level
+workflows that use them are typed as `Operation<T>`. The infrastructure
+effects resolve synchronously in the reducer and produce no Yield events —
+only the child workflows' `DurableEffect` values appear in the journal.
+`durableRun` accepts the `Workflow<T> | Operation<T>` union, so both
+pure-leaf workflows and combinator-using workflows work seamlessly.
 
 ### 11.2 Rejected (type error)
 
 | Operation | Why it's rejected |
 |-----------|-------------------|
 | `useAbortSignal()` | Returns a scope-bound resource that doesn't survive replay |
-| `useScope()` | Infrastructure effect — not durable |
 | `each(stream)` | Streams are stateful subscriptions, not serializable |
 | `resource(fn)` | Resources hold live state (connections, handles) |
-| `ensure(fn)` | Registers cleanup that may not be serializable |
 | `on(target, name)` | EventTarget-based, not serializable |
 | `sleep(ms)` | Effection's `sleep` — use `durableSleep` instead |
 | `call(fn)` | Effection's `call` — use `durableCall` instead |
@@ -871,129 +1106,75 @@ Key validations:
 | Serialization boundary | ✅ Resolved | `T extends Json` type constraint (DEC-018) |
 | DurableStream interface | ✅ Resolved | `readAll()` + `append()`, InMemoryStream for tests |
 | Terminal divergence detection | ✅ Resolved | Both cases implemented with 3 error classes (DEC-008) |
-| durableSpawn implementation | ✅ Resolved | Single DurableEffect, scope management in `enter()` |
+| durableSpawn implementation | ✅ Resolved | Operations using Effection's native spawn/all/race |
 | Batch persistence | ⏳ Deferred | Needed for `all()`/`race()`, not yet in scope |
 | Durable `each()` | ⏳ Future | Design target for long-running consumption |
 
-### 12.1 durableSpawn implementation (resolved)
+### 12.1 Structured concurrency combinators (resolved)
 
-`durableSpawn` is a `DurableEffect` whose `enter()` calls `scope.spawn()`
-— the imperative API on every Effection scope for creating concurrent
-child tasks. No generator yielding, no infrastructure effects leaking
-through the parent workflow's iterator.
-
-From the parent workflow's perspective, `durableSpawn` yields a single
-`DurableEffect` that resolves to a `Task<T>`. The child workflow, being a
-`Workflow<T>` itself, only yields `DurableEffect` values within its own
-coroutine. The two coroutines have independent iterators — the child's
-effects never pass through the parent's iterator.
-
-Spawn events are not journaled. The spec's examples confirm this: coroutine
-IDs appear in `Yield` and `Close` events, but there is no "spawn" event in
-the stream. Spawns are reconstructed from the deterministic structure of
-the code (§3.2). Since the same code with the same resolution sequence
-always spawns the same children in the same order, recording spawn events
-would be redundant.
+The combinators are **`Operation` generators, not `DurableEffect`s.** This
+is a significant departure from the earlier design sketches. The key insight:
+combinators don't need to be durable effects because spawns are not journaled.
+They're pure scope plumbing that delegates to Effection's native structured
+concurrency primitives.
 
 ```typescript
-function* durableSpawn<T>(op: () => Workflow<T>): Workflow<Task<T>> {
-  return (yield {
-    description: "durableSpawn",
-    effectDescription: { type: "spawn", name: "spawn" },
+// durableSpawn, durableAll, durableRace all return Operation<T>
+function* durableSpawn<T extends Json | void>(op): Operation<Task<T>> { ... }
+function* durableAll<T extends Json | void>(ops): Operation<T[]> { ... }
+function* durableRace<T extends Json | void>(ops): Operation<T> { ... }
+```
 
-    enter(resolve, routine) {
-      const scope = routine.scope;
-      const parentCtx = scope.expect(DurableCtx);
+**How combinators interact with the type system.** A `Workflow<T>` is
+`Generator<DurableEffect<unknown>, T, unknown>` — it constrains what the
+generator *yields*. Combinators return `Operation<T>` because they yield
+infrastructure effects (`useScope()`, `spawn()`) internally. This means
+`yield* durableAll(...)` inside a generator annotated as `Workflow<T>`
+would be a type error — the delegated generator's `Effect<unknown>` yield
+values conflict with the `DurableEffect<unknown>` constraint.
 
-      // Assign deterministic coroutine ID
-      const childId = `${parentCtx.coroutineId}.${parentCtx.childCounter++}`;
+In practice, top-level workflows that use combinators are typed as
+`Operation<T>`, not `Workflow<T>`:
 
-      // scope.spawn() is imperative — no generator, nothing yielded
-      // through the parent's iterator. The child runs concurrently
-      // in its own coroutine.
-      const task = scope.spawn(function* (): Operation<T> {
-        const childScope = yield* useScope();
-
-        // Set up durable context for the child coroutine
-        childScope.set(DurableCtx, {
-          replayIndex: parentCtx.replayIndex,
-          stream: parentCtx.stream,
-          coroutineId: childId,
-          childCounter: 0,
-        });
-
-        // Close event emission via try/finally — no ensure() needed.
-        // Default is cancelled; overwritten on success or error.
-        let result: Result = { status: "cancelled" };
-        try {
-          const value = yield* op();
-          result = { status: "ok", value: serialize(value) };
-          return value;
-        } catch (error) {
-          result = {
-            status: "err",
-            error: serializeError(
-              error instanceof Error ? error : new Error(String(error)),
-            ),
-          };
-          throw error;
-        } finally {
-          const ctx = childScope.expect(DurableCtx);
-          await ctx.stream.append({
-            type: "close",
-            coroutineId: ctx.coroutineId,
-            result,
-          });
-        }
-      });
-
-      // Resolve synchronously with the task handle — the parent can
-      // join on it later. The spawn itself is not journaled.
-      resolve({ ok: true, value: task });
-      return (exit) => exit({ ok: true, value: undefined });
-    },
-  } as DurableEffect<Task<T>>) as Task<T>;
+```typescript
+// This is typed as Operation<string>, not Workflow<string>
+function* myWorkflow() {
+  const prefix = yield* durableCall("step1", () => fetchPrefix());
+  const results = yield* durableAll([
+    function* () { return yield* durableCall("a", () => fetchA()); },
+    function* () { return yield* durableCall("b", () => fetchB()); },
+  ]);
+  return `${prefix}-${results.join(",")}`;
 }
 ```
 
-Key details:
+`durableRun` accepts `() => Workflow<T> | Operation<T>`, so this works.
+The `Workflow<T>` annotation is most useful for leaf-level generator
+functions and child workflows passed to combinators — those generators
+only yield `DurableEffect` values and benefit from the compile-time
+constraint. The combinators themselves ensure that only durable-safe
+children are accepted.
 
-- **`scope.spawn()` is imperative.** It's a method on the scope object,
-  not a generator that yields effects. Calling it from inside `enter()`
-  creates a concurrent child coroutine in the reducer without yielding
-  anything through the parent workflow's iterator. This is the same API
-  Effection uses internally.
+**Why not the DurableEffect-in-enter() approach.** The earlier sketch had
+durableSpawn as a raw `DurableEffect` calling `scope.spawn()` inside
+`enter()`. This had problems: (1) `CoroutineView` didn't expose `spawn()`,
+(2) mixing imperative scope calls inside `enter()` is fighting Effection's
+design rather than working with it, (3) it couldn't use `all()` or `race()`
+which are generator-based. Using Effection's native combinators gets error
+isolation (`trap()`), cancellation propagation, and scope lifetime
+management for free.
 
-- **Infrastructure effects are internal.** The `useScope()` call inside
-  the `scope.spawn()` callback is in an `Operation<T>` context (the
-  child's coroutine), not in the parent's `Workflow<T>` context. The
-  parent only sees the single `DurableEffect` that `durableSpawn` yields.
+**The `runDurableChild` helper.** All three combinators share a single
+helper that wraps child workflows with DurableContext and Close event
+handling. See §8.1 for the full implementation. This is the single point
+of responsibility for child lifecycle — DurableContext setup, Close event
+short-circuiting, the suspend() trick for cancelled replay, and the
+no-re-emission guard.
 
-- **Close events via try/finally.** The `result` variable defaults to
-  `cancelled`. Normal completion overwrites it to `ok` before `finally`.
-  Errors overwrite it to `err` in `catch` before `finally`. Cancellation
-  (where Effection calls `iterator.return()`) skips both, leaving the
-  default. No Effection infrastructure effects (`ensure()`) needed —
-  just JavaScript.
-
-- **Resolve is synchronous.** The parent gets the `Task<T>` handle
-  immediately. The child runs concurrently. Joining on the task
-  blocks the parent until the child completes — same as regular Effection.
-
-- **Replay of spawns.** During replay, the parent yields the `durableSpawn`
-  effect. The `enter()` method runs, calls `scope.spawn()`, assigns the
-  same coroutine ID (deterministic counter), and starts the child. The
-  child's `DurableEffect.enter()` calls then individually check the
-  replay index using the child's coroutine ID. The parent and child replay
-  independently, per-coroutine, exactly as the spec describes (§4.3).
-
-- **CoroutineView needs `spawn()`.** The current `CoroutineView` interface
-  only has `get`, `expect`, `set` on `scope`. For `durableSpawn`, it needs
-  `spawn(op: () => Operation<T>): Task<T>` added to the scope shape.
-
-The same pattern applies to `durableAll` and `durableRace` — they are
-`DurableEffect`s whose `enter()` methods call `scope.spawn()` to create
-concurrent children.
+**Accepting `Workflow<T> | Operation<T>`.** The combinators accept either
+type for child workflows. This is pragmatic — it allows mixing durable
+and non-durable children when the caller knows what they're doing. The
+`durableRun` entry point also accepts this union.
 
 ### 12.2 Serialization boundary (resolved)
 
@@ -1083,16 +1264,16 @@ This is a future concern but worth noting as a design target.
 | `Operation<T>` | No | Unchanged. `Workflow` is a subtype. |
 | `Scope` / `ScopeInternal` | No | Unchanged. Durable context stored via existing Context system. |
 | `Context` | No | Unchanged. Used to store `DurableContext`. |
-| `Api.around()` | No | Unchanged. May be used to layer Close event emission. |
+| `Api.around()` | No | Unchanged. Not used — Close events handled via try/finally in `runDurableChild`. |
 | `PriorityQueue` | No | Unchanged. Deterministic ordering enables replay. |
 | `createTask()` | No | Unchanged. Durable variant wraps it with context setup. |
-| `spawn()`, `all()`, `race()` | No | Unchanged. Durable variants wrap them. |
+| `spawn()`, `all()`, `race()` | No | Unchanged. Durable combinators delegate to them directly. |
 
 ---
 
 ## 14. Progress and next steps
 
-### Completed (Tier 1-2)
+### Completed (Tier 1-4)
 
 1. ~~Validate type system~~ — `Workflow<T>` rejects `Operation` usage at
    compile time (DEC-009, `test/types_test.ts`).
@@ -1109,23 +1290,31 @@ This is a future concern but worth noting as a design target.
    (`test/durable-run_test.ts`).
 7. ~~Run Tier 2 tests~~ — All divergence detection cases passing
    (`test/divergence_test.ts`).
+8. ~~Implement `durableSpawn`, `durableAll`, `durableRace`~~ — Operation
+   generators wrapping Effection's native spawn/all/race, with shared
+   `runDurableChild` helper (`lib/combinators.ts`).
+9. ~~Run Tier 3 tests~~ — Fork/join, nested scopes, race with
+   cancellation, error propagation, partial replay — all passing
+   (`test/structured-concurrency_test.ts`).
+10. ~~Run Tier 4 tests~~ — Deterministic coroutine IDs across runs,
+    live vs replay, nested hierarchical IDs, race IDs — all passing
+    (`test/deterministic-id_test.ts`).
+
+11. ~~Durable Streams backend adapter~~ — `HttpDurableStream` implements
+    `DurableStream` over HTTP with raw fetch for appends, promise chain
+    serialization, fail-fast on fatal errors, offset tracking
+    (`lib/http-stream.ts`, `test/http-stream_test.ts`, DEC-026–029).
+12. ~~Cleanup pass~~ — effection-pro code review: hardened error handling
+    (all uncertain write outcomes fatal), preserved original errors in
+    `durableRun` catch block, `readAll()` honors custom fetch, 2 new
+    tests (73 total).
 
 ### Next
 
-8. **Implement `durableSpawn`, `durableAll`, `durableRace`.** Structured
-   concurrency combinators. Each is a `DurableEffect` whose `enter()`
-   does scope management internally via `scope.spawn()`.
-
-9. **Run spec Tier 3–4 tests.** Structured concurrency, deterministic
-   identity, cancellation replay.
-
-10. **Durable Streams backend adapter.** Wire `DurableStream` to the
-    Durable Streams protocol (see `durable-streams.md` for mapping).
-
-11. **Batch persistence (Strategy C).** Optimize concurrent child effects
+13. **Batch persistence (Strategy C).** Optimize concurrent child effects
     by batching writes within a single reduce cycle.
 
-12. **Implement `durableEach`.** Durable iteration primitive for
+14. **Implement `durableEach`.** Durable iteration primitive for
     long-running consumption (message queues, event streams). Each
     iteration checkpoints its position — crash recovery resumes at
     the next unconsumed item, enabling each loop iteration to run

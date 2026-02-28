@@ -112,6 +112,13 @@ export class HttpDurableStream implements DurableStream {
    *
    * Uses the stream() function from @durable-streams/client with
    * offset="-1" (start of stream) and live=false (no tailing).
+   *
+   * Response shape (verified against @durable-streams/client@0.2.1):
+   * - `res.json()` returns a parsed JSON array of events (the server
+   *   sends Content-Type: application/json with a JSON array body,
+   *   and the client's StreamResponseImpl.json() parses it)
+   * - `res.offset` is a getter on StreamResponseImpl that returns
+   *   the Stream-Next-Offset header value as a string
    */
   async readAll(): Promise<DurableEvent[]> {
     const res = await stream({
@@ -237,7 +244,14 @@ export class HttpDurableStream implements DurableStream {
         throw error;
       }
       default: {
-        // Unexpected status — fatal, write outcome is uncertain
+        // Unexpected status — fatal, write outcome is uncertain.
+        // TODO: Transient errors (500, 503) could be retried with the
+        // same seq in a future version. Currently treated as fatal because
+        // we can't know whether the server persisted the event — if it
+        // did, the next seq succeeds; if not, the next seq hits a 409 gap.
+        // Retry-with-same-seq logic would make transient errors recoverable,
+        // but that requires backoff, max-retry limits, and idempotency
+        // awareness that are out of scope for the initial adapter.
         const error = new Error(
           `Unexpected append response: HTTP ${res.status}`,
         );
