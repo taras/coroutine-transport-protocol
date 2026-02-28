@@ -10,10 +10,13 @@
 export type {
   Close,
   CoroutineId,
+  CoroutineView,
   DurableEffect,
   DurableEvent,
   EffectDescription,
+  EffectionResult,
   Json,
+  Resolve,
   Result,
   SerializedError,
   Workflow,
@@ -28,4 +31,8 @@ export type { DurableStream } from "./stream.ts";
 export { InMemoryStream } from "./stream.ts";
 
 // Errors
-export { DivergenceError } from "./errors.ts";
+export {
+  ContinuePastCloseDivergenceError,
+  DivergenceError,
+  EarlyReturnDivergenceError,
+} from "./errors.ts";

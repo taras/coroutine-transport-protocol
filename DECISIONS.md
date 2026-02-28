@@ -143,3 +143,83 @@ Updated before completion of every phase and committed at the end of each phase.
   handling.
 - **Consequences:** Error handling code can match on the common name
   `"DivergenceError"` or use instanceof for specific cases.
+
+## DEC-009: Workflow<T> = Generator<DurableEffect<unknown>, T, unknown>
+
+- **Phase:** 1 (Protocol Types)
+- **Date:** 2026-02-28
+- **Context:** Need a type that constrains generator yields to durable effects
+  only, while remaining assignable to Effection's Operation<T>.
+- **Options considered:**
+  1. `Iterable<DurableEffect<unknown>, T, unknown>` — TypeScript's Iterable
+     only has 1 type parameter in the standard lib, cannot constrain yields.
+  2. `Generator<DurableEffect<unknown>, T, unknown>` — has 3 type parameters
+     (Yield, Return, Next).
+  3. Custom interface extending both Generator and Operation.
+- **Decision:** `Generator<DurableEffect<unknown>, T, unknown>`
+- **Rationale:** Generator's 3 type parameters give TypeScript enough
+  information to enforce the yield constraint. When a user writes
+  `function*(): Workflow<T>`, TS checks that every `yield` expression
+  produces a value assignable to `DurableEffect<unknown>`. Verified:
+  `yield* sleep(1000)` inside a Workflow produces TS2741 error.
+- **Consequences:** Workflow generators use `yield` (not `yield*`) for direct
+  DurableEffect interaction, and `yield*` for delegating to other Workflows.
+  The cast `as T` is needed when `yield`-ing a DurableEffect since TS types
+  the yield expression as `unknown`.
+
+## DEC-010: DurableEffect mirrors Effection's Effect interface shape exactly
+
+- **Phase:** 1 (Protocol Types)
+- **Date:** 2026-02-28
+- **Context:** DurableEffect needs to be structurally compatible with
+  Effection's `Effect<T>` interface so the reducer processes it identically.
+- **Decision:** DurableEffect<T> has the same `description: string` and
+  `enter(resolve, routine)` signature as Effect<T>, plus the additional
+  `effectDescription: EffectDescription` field.
+- **Rationale:** Effection's Effect<T> uses:
+  - `enter(resolve: Resolve<Result<T>>, routine: Coroutine)`
+  - returns `(resolve: Resolve<Result<void>>) => void` (teardown)
+  - `Result<T> = { ok: true, value: T } | { ok: false, error: Error }`
+  DurableEffect replicates this exactly. The extra field doesn't affect
+  structural compatibility — the reducer ignores unknown properties.
+- **Consequences:** Two different "Result" types exist — Effection's internal
+  `{ ok, value/error }` and the protocol's `{ status, value/error }`. We
+  define `EffectionResult<T>` in types.ts to bridge them without importing
+  from Effection.
+
+## DEC-011: CoroutineView — minimal interface instead of importing Coroutine
+
+- **Phase:** 1 (Protocol Types)
+- **Date:** 2026-02-28
+- **Context:** The `enter()` callback receives an Effection `Coroutine` object.
+  We need `routine.scope` to read DurableContext. Coroutine is marked
+  `@ignore` in Effection's types (not part of public API).
+- **Options considered:**
+  1. Import Coroutine type from Effection internals
+  2. Use `unknown` and cast at runtime
+  3. Define a minimal CoroutineView interface with only what we need
+- **Decision:** Define `CoroutineView` with `scope` property typed to match
+  Scope's `get()`, `expect()`, `set()` methods.
+- **Rationale:** Avoids depending on Effection's private API surface. The
+  minimal interface documents exactly which Coroutine fields we rely on.
+  If Effection's internal shape changes, the break is localized to this
+  interface.
+- **Consequences:** At runtime, `enter()` receives the full Coroutine object.
+  TypeScript sees only our CoroutineView. This works because we only access
+  `scope.expect(context)` which is a public Scope method.
+
+## DEC-012: Verified — routine.scope is accessible in enter() callback
+
+- **Phase:** 1 (Protocol Types)
+- **Date:** 2026-02-28
+- **Context:** The key risk identified in the plan was whether `routine.scope`
+  is accessible from within `enter()`. Needed to confirm from Effection 4.1
+  alpha source.
+- **Decision:** Confirmed. Effection's `Coroutine` interface in
+  `lib/types.ts` (line ~465) has `scope: Scope`. The reducer passes the
+  full Coroutine object to `enter()`. We can access `routine.scope.expect(ctx)`
+  to read DurableContext from within a DurableEffect's enter method.
+- **Rationale:** Verified by reading Effection 4.1.0-alpha.5 source:
+  `interface Coroutine<T> { scope: Scope; data: { ... }; next(...); return(...); }`
+- **Consequences:** No workaround needed. The direct approach from the
+  integration doc works.

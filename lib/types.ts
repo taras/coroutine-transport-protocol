@@ -71,31 +71,68 @@ export type DurableEvent = Yield | Close;
 // Effection integration types
 // ---------------------------------------------------------------------------
 
-// NOTE: DurableEffect and Workflow types will be defined in Phase 1
-// once we verify the exact Effection 4.1 alpha types.
-// Placeholder re-exports for now.
+/**
+ * Effection's internal Result type (distinct from the protocol's Result).
+ *
+ * Effection uses { ok: true, value: T } | { ok: false, error: Error }.
+ * The protocol uses { status: "ok" | "err" | "cancelled" }.
+ * We re-declare Effection's shape here so types.ts has no Effection imports.
+ */
+export type EffectionResult<T> =
+  | { readonly ok: true; value: T }
+  | { readonly ok: false; error: Error };
 
 /**
- * A DurableEffect extends Effection's Effect with a structured description
- * for divergence detection and replay.
+ * Effection's Resolve callback type.
+ */
+export type Resolve<T> = (value: T) => void;
+
+/**
+ * Minimal view of Effection's Coroutine — only the fields we need.
+ * The full Coroutine type is internal to Effection (@ignore), but
+ * enter() receives it. We need `scope` to read DurableContext.
+ */
+export interface CoroutineView {
+  scope: {
+    get<T>(context: { name: string; defaultValue?: T }): T | undefined;
+    expect<T>(context: { name: string }): T;
+    set<T>(context: { name: string }, value: T): T;
+  };
+}
+
+/**
+ * A DurableEffect extends Effection's Effect interface with a structured
+ * `effectDescription` for divergence detection and replay.
  *
- * This is a placeholder — the full definition depends on Effection's
- * Effect interface shape in 4.1.0-alpha.5.
+ * The `enter()` signature matches Effection 4.1.0-alpha.5's Effect<T> exactly:
+ *   enter(resolve: Resolve<EffectionResult<T>>, routine: Coroutine):
+ *     (resolve: Resolve<EffectionResult<void>>) => void
+ *
+ * DurableEffect<T> is assignable to Effect<T> because it has the same shape
+ * plus the extra `effectDescription` field.
  */
 export interface DurableEffect<T> {
+  /** Human-readable description (for Effection's Effect interface). */
   description: string;
+  /** Structured description for divergence detection (spec §6). */
   effectDescription: EffectDescription;
+  /** Enter the effect — handles replay/live dispatch internally. */
   enter(
-    resolve: (result: { ok: true; value: T } | { ok: false; error: Error }) => void,
-    routine: unknown,
-  ): (resolve: (result: { ok: true; value: void } | { ok: false; error: Error }) => void) => void;
+    resolve: Resolve<EffectionResult<T>>,
+    routine: CoroutineView,
+  ): (resolve: Resolve<EffectionResult<void>>) => void;
 }
 
 /**
  * A Workflow is a generator that only yields DurableEffect values.
- * Every Workflow is an Operation, but not every Operation is a Workflow.
+ *
+ * Every Workflow is structurally compatible with Operation<T> because
+ * DurableEffect<unknown> extends Effect<unknown> (it has all required fields).
+ * TypeScript's covariant yield type means Generator<DurableEffect, T, unknown>
+ * is assignable to Iterator<Effect, T, unknown>.
  *
  * Uses Generator (not Iterable) so TypeScript enforces the yield type
- * at compile time.
+ * at compile time — yielding a plain Effect inside a Workflow generator
+ * is a type error.
  */
 export type Workflow<T> = Generator<DurableEffect<unknown>, T, unknown>;
