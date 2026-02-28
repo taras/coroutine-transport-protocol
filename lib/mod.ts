@@ -31,6 +31,10 @@ export type { YieldEntry } from "./replay-index.ts";
 export type { DurableStream } from "./stream.ts";
 export { InMemoryStream } from "./stream.ts";
 
+// HTTP-backed stream adapter
+export { HttpDurableStream } from "./http-stream.ts";
+export type { HttpDurableStreamOptions } from "./http-stream.ts";
+
 // Errors
 export {
   ContinuePastCloseDivergenceError,

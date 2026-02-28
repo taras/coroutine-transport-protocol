@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "exports": "./lib/mod.ts",
   "tasks": {
-    "test": "deno test --allow-net --allow-read",
+    "test": "deno test --allow-net --allow-read --allow-env --allow-ffi",
     "check": "deno check lib/mod.ts",
     "typecheck": "deno check lib/**/*.ts test/**/*.ts"
   },

@@ -497,3 +497,92 @@ Updated before completion of every phase and committed at the end of each phase.
   divergence errors. This is a deliberate relaxation of the spec. The spec
   should be updated to reflect this (test 27 verifies graceful handling,
   not DivergenceError).
+
+## DEC-026: Direct HTTP append with raw fetch, not IdempotentProducer
+
+- **Phase:** 5 (HttpDurableStream)
+- **Date:** 2026-02-28
+- **Context:** The `@durable-streams/client` package provides an
+  `IdempotentProducer` class designed for throughput workloads (fire-and-forget
+  + background flush). Need to decide whether to use it or raw `fetch()`.
+- **Options considered:**
+  1. `IdempotentProducer` with `lingerMs=0` and await flush after every append
+  2. Raw `fetch()` with manual producer headers
+- **Decision:** Raw `fetch()` with manual `Producer-Id`, `Producer-Epoch`,
+  `Producer-Seq` headers on each POST.
+- **Rationale:** Durable execution requires synchronous acknowledgment on
+  every write (persist-before-resume, spec §5). Setting `lingerMs=0` and
+  awaiting flush after every append makes the producer pure overhead — it
+  batches nothing and adds an abstraction layer. Raw fetch captures
+  `Stream-Next-Offset` from every response, which is needed for future
+  `tail()` calls.
+- **Consequences:** More code in `HttpDurableStream.doAppend()` but full
+  control over request/response handling. Error types (`StaleEpochError`,
+  `SequenceGapError`) are still imported from the client package.
+
+## DEC-027: Promise chain serialization for concurrent appends
+
+- **Phase:** 5 (HttpDurableStream)
+- **Date:** 2026-02-28
+- **Context:** When `durableAll` runs N children, their effects may resolve
+  in the same tick. Each child's `createDurableEffect.enter()` calls
+  `stream.append()` — producing concurrent promises. If two POSTs with
+  seq=5 and seq=6 arrive out of order (HTTP/2 multiplexing), the server
+  returns 409 (sequence gap).
+- **Options considered:**
+  1. Mutex/lock around append
+  2. Promise chain serialization
+  3. Accept 409 and retry with correct seq
+- **Decision:** Promise chain serialization. Sequence numbers are assigned
+  synchronously (before any async work). HTTP calls are chained behind
+  `this.pending`: `const p = this.pending.then(() => this.doAppend(...));
+  this.pending = p.catch(() => {});`
+- **Rationale:** Each caller still awaits their own append promise. Ordering
+  matches seq assignment order. The `p.catch(() => {})` pattern prevents
+  failed appends from blocking future ones in the chain, but errors still
+  propagate to the original caller. This is simpler than a mutex and avoids
+  the complexity of retry logic.
+- **Consequences:** Appends execute in strict sequence order. A fatal error
+  (e.g., StaleEpochError) sets `this.fatalError` so future appends fail-fast
+  without making HTTP calls.
+
+## DEC-028: Close event append in finally block is cancellable (best-effort)
+
+- **Phase:** 5 (HttpDurableStream)
+- **Date:** 2026-02-28
+- **Context:** `runDurableChild` (in `lib/combinators.ts`) appends Close
+  events in a `finally` block via `yield* call(() => stream.append(...))`.
+  When the parent scope is torn down (e.g., race winner cancels losers),
+  this async operation can be interrupted.
+- **Decision:** Accept that Close event appends in finally blocks are
+  best-effort. Missing Close events just mean the child re-executes on
+  replay (idempotent).
+- **Rationale:** Effection does not currently expose an uncancellable
+  context for finally blocks. The in-memory stream completes synchronously
+  so this is not an issue in tests. For the HTTP adapter, the serialized
+  POST may be interrupted mid-flight. The protocol handles this gracefully:
+  a missing Close event means the child has no replay short-circuit, so it
+  re-executes live on the next run.
+- **Consequences:** In rare cases (parent cancellation racing with child
+  cleanup), a Close event may not be persisted. The workflow remains correct
+  because re-execution is idempotent. A future enhancement could use an
+  uncancellable context when Effection exposes one.
+
+## DEC-029: Track Stream-Next-Offset from every HTTP response
+
+- **Phase:** 5 (HttpDurableStream)
+- **Date:** 2026-02-28
+- **Context:** The Durable Streams server returns a `Stream-Next-Offset`
+  header on every successful append (200) and on reads. This is an opaque
+  offset string (e.g., `0000000000000000_0000000000000118`) that represents
+  the position after the last written event.
+- **Decision:** Store `lastOffset` from both reads (`res.offset` from the
+  client's `stream()` function) and writes (`Stream-Next-Offset` header
+  from raw fetch responses).
+- **Rationale:** The offset is the resumption point for future `tail()`
+  calls (SSE/long-poll tailing, not yet implemented). Cheap to capture now,
+  annoying to retrofit later. The field is public (`lastOffset`) for
+  inspection in tests.
+- **Consequences:** `lastOffset` is updated as a side effect of `readAll()`
+  and `append()`. Nothing consumes it yet, but it's available for the
+  tailing feature when implemented.
