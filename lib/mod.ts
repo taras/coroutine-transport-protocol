@@ -62,6 +62,9 @@ export {
   versionCheck,
 } from "./operations.ts";
 
+// Structured concurrency combinators
+export { durableAll, durableRace, durableSpawn } from "./combinators.ts";
+
 // Entry point
 export { durableRun } from "./run.ts";
 export type { DurableRunOptions } from "./run.ts";

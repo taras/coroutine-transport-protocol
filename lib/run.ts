@@ -9,6 +9,7 @@
  */
 
 import { createScope } from "@effection/effection";
+import type { Operation } from "@effection/effection";
 import { DurableCtx } from "./context.ts";
 import { EarlyReturnDivergenceError } from "./errors.ts";
 import { ReplayIndex } from "./replay-index.ts";
@@ -39,7 +40,7 @@ export interface DurableRunOptions {
  * Returns the workflow's result value.
  */
 export async function durableRun<T extends Json | void>(
-  workflow: () => Workflow<T>,
+  workflow: () => Workflow<T> | Operation<T>,
   options: DurableRunOptions,
 ): Promise<T> {
   const { stream, coroutineId = "root" } = options;
@@ -112,6 +113,13 @@ export async function durableRun<T extends Json | void>(
 
     throw error;
   } finally {
-    await destroy();
+    // Swallow destroy errors. If the scope is in an error state (e.g.,
+    // a child threw), destroy() may throw "halted". We don't want that
+    // to mask the original error from the catch block.
+    try {
+      await destroy();
+    } catch {
+      // Scope cleanup errors are expected when the workflow failed.
+    }
   }
 }
