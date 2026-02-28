@@ -81,14 +81,14 @@ export class HttpDurableStream implements DurableStream {
   /**
    * Create an HttpDurableStream, ensuring the server-side stream exists.
    *
-   * Sends PUT to create the stream. If it already exists (409), that's fine.
+   * Sends PUT to create the stream. 201 = created, 200 = already exists.
    */
   static async connect(
     opts: HttpDurableStreamOptions,
   ): Promise<HttpDurableStream> {
     const instance = new HttpDurableStream(opts);
 
-    // Create the stream on the server (idempotent — 409 means it exists)
+    // Create the stream on the server (idempotent — 200 means it exists)
     const fetchFn = opts.fetch ?? globalThis.fetch.bind(globalThis);
     const res = await fetchFn(instance.streamUrl, {
       method: "PUT",
@@ -118,6 +118,7 @@ export class HttpDurableStream implements DurableStream {
       url: this.streamUrl,
       offset: "-1",
       live: false,
+      fetch: this._fetch,
     });
     const events = await res.json() as DurableEvent[];
     // Track offset from read (DEC-029)
@@ -159,6 +160,12 @@ export class HttpDurableStream implements DurableStream {
 
   /**
    * Execute a single HTTP append with the given event and sequence number.
+   *
+   * Any uncertain write outcome (network error, unexpected HTTP status,
+   * sequence gap) is treated as fatal — `fatalError` is set so all future
+   * appends fail-fast. This prevents sequence drift where later appends
+   * would hit 409 SequenceGapError because an earlier seq was never
+   * acknowledged.
    */
   private async doAppend(event: DurableEvent, seq: number): Promise<void> {
     // Double-check fatal error (may have been set by a preceding append in the chain)
@@ -166,16 +173,26 @@ export class HttpDurableStream implements DurableStream {
       throw this.fatalError;
     }
 
-    const res = await this._fetch(this.streamUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        [PRODUCER_ID_HEADER]: this.producerId,
-        [PRODUCER_EPOCH_HEADER]: String(this.epoch),
-        [PRODUCER_SEQ_HEADER]: String(seq),
-      },
-      body: JSON.stringify(event),
-    });
+    let res: Response;
+    try {
+      res = await this._fetch(this.streamUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [PRODUCER_ID_HEADER]: this.producerId,
+          [PRODUCER_EPOCH_HEADER]: String(this.epoch),
+          [PRODUCER_SEQ_HEADER]: String(seq),
+        },
+        body: JSON.stringify(event),
+      });
+    } catch (err) {
+      // Network failure — fatal, sequence state is now uncertain
+      const error = err instanceof Error
+        ? err
+        : new Error(String(err));
+      this.fatalError = error;
+      throw error;
+    }
 
     // Always consume the body to free the connection
     await res.text();
@@ -207,19 +224,26 @@ export class HttpDurableStream implements DurableStream {
         throw error;
       }
       case 409: {
-        // Sequence gap — should never happen due to serialization
+        // Sequence gap — fatal (should never happen due to serialization,
+        // but if it does, sequence state is irrecoverably desynchronized)
         const expected = Number(
           res.headers.get(PRODUCER_EXPECTED_SEQ_HEADER) ?? 0,
         );
         const received = Number(
           res.headers.get(PRODUCER_RECEIVED_SEQ_HEADER) ?? 0,
         );
-        throw new SequenceGapError(expected, received);
+        const error = new SequenceGapError(expected, received);
+        this.fatalError = error;
+        throw error;
       }
-      default:
-        throw new Error(
+      default: {
+        // Unexpected status — fatal, write outcome is uncertain
+        const error = new Error(
           `Unexpected append response: HTTP ${res.status}`,
         );
+        this.fatalError = error;
+        throw error;
+      }
     }
   }
 }

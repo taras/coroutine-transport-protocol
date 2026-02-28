@@ -448,3 +448,116 @@ Deno.test("http: lastOffset tracked from readAll and append", async () => {
     assertEquals(typeof offsetAfterEmptyRead, "string");
   }
 });
+
+// ---------------------------------------------------------------------------
+// Test 10: Append failure followed by another append — fail-fast
+// ---------------------------------------------------------------------------
+
+Deno.test("http: append failure makes subsequent appends fail-fast", async () => {
+  await serverReady;
+  const streamId = uniqueStreamId();
+
+  let postCount = 0;
+  // deno-lint-ignore no-explicit-any
+  const flakyFetch = (input: any, init: any) => {
+    if (init?.method === "PUT") {
+      return globalThis.fetch(input, init);
+    }
+    postCount++;
+    // First POST fails with network error
+    return Promise.reject(new Error("Connection reset"));
+  };
+
+  const stream = await HttpDurableStream.connect({
+    baseUrl,
+    streamId,
+    producerId: "p1",
+    epoch: 1,
+    fetch: flakyFetch,
+  });
+
+  // First append — fails with network error
+  await assertRejects(
+    () =>
+      stream.append({
+        type: "yield",
+        coroutineId: "root",
+        description: { type: "call", name: "stepA" },
+        result: { status: "ok", value: "alpha" },
+      }),
+    Error,
+    "Connection reset",
+  );
+
+  assertEquals(postCount, 1);
+
+  // Second append — should fail-fast with the same fatal error,
+  // without making another HTTP call
+  await assertRejects(
+    () =>
+      stream.append({
+        type: "yield",
+        coroutineId: "root",
+        description: { type: "call", name: "stepB" },
+        result: { status: "ok", value: "beta" },
+      }),
+    Error,
+    "Connection reset",
+  );
+
+  // No additional HTTP calls were made
+  assertEquals(postCount, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Test 11: durableRun preserves original error when Close(err) append fails
+// ---------------------------------------------------------------------------
+
+Deno.test("http: durableRun preserves original error when close append fails", async () => {
+  await serverReady;
+  const streamId = uniqueStreamId();
+
+  let postCount = 0;
+  // deno-lint-ignore no-explicit-any
+  const failAfterTwoFetch = (input: any, init: any) => {
+    if (init?.method === "PUT") {
+      return globalThis.fetch(input, init);
+    }
+    if (init?.method === "POST") {
+      postCount++;
+      // Allow first 2 appends (the Yield events), fail on 3rd (the Close event)
+      if (postCount <= 2) {
+        return globalThis.fetch(input, init);
+      }
+      return Promise.reject(new Error("Stream write failed"));
+    }
+    // GET for readAll
+    return globalThis.fetch(input, init);
+  };
+
+  const stream = await HttpDurableStream.connect({
+    baseUrl,
+    streamId,
+    producerId: "p1",
+    epoch: 1,
+    fetch: failAfterTwoFetch,
+  });
+
+  // Workflow that throws after its effects complete
+  const err = await assertRejects(
+    () =>
+      durableRun(
+        function* (): Workflow<string> {
+          yield* durableCall("stepA", () => Promise.resolve("alpha"));
+          throw new Error("Workflow kaboom");
+        },
+        { stream },
+      ),
+    Error,
+    "Workflow kaboom",
+  );
+
+  // The original workflow error is preserved, not replaced by
+  // "Stream write failed" from the Close(err) append
+  assertEquals((err as Error).message, "Workflow kaboom");
+});

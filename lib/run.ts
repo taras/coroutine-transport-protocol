@@ -98,7 +98,9 @@ export async function durableRun<T extends Json | void>(
 
     return result;
   } catch (error) {
-    // Append Close(err) event
+    // Append Close(err) event — best-effort. If the append itself fails
+    // (e.g., stream is in a fatal state), we still throw the original
+    // workflow error so it isn't masked by the append failure.
     const closeEvent: Close = {
       type: "close",
       coroutineId,
@@ -109,7 +111,11 @@ export async function durableRun<T extends Json | void>(
         ),
       },
     };
-    await stream.append(closeEvent);
+    try {
+      await stream.append(closeEvent);
+    } catch {
+      // Close event append failed — the original error is more important.
+    }
 
     throw error;
   } finally {
