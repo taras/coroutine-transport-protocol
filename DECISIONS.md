@@ -223,3 +223,18 @@ Updated before completion of every phase and committed at the end of each phase.
   `interface Coroutine<T> { scope: Scope; data: { ... }; next(...); return(...); }`
 - **Consequences:** No workaround needed. The direct approach from the
   integration doc works.
+
+## DEC-013: ReplayIndex follows spec §4.1 exactly with no extensions
+
+- **Phase:** 2 (ReplayIndex)
+- **Date:** 2026-02-28
+- **Context:** The spec provides a reference implementation of ReplayIndex in
+  §4.1. Could add extra features (e.g., event filtering, offset tracking).
+- **Decision:** Follow the spec exactly. Only additions are `getCursor()` and
+  `yieldCount()` which are trivial derived accessors for diagnostics/testing.
+- **Rationale:** The ReplayIndex is a critical correctness component. Staying
+  minimal and spec-aligned reduces the risk of subtle bugs. Extra features
+  can be added if needed.
+- **Consequences:** All replay logic depends on this class. It is thoroughly
+  tested (21 tests covering empty index, single/multiple yields, close events,
+  interleaved coroutines, race scenarios, and spec examples).
