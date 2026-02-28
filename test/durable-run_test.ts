@@ -10,7 +10,6 @@ import { assertEquals, assertRejects } from "@std/assert";
 import {
   durableCall,
   durableRun,
-  durableSleep,
   InMemoryStream,
   type DurableEvent,
   type Json,
@@ -27,9 +26,9 @@ function createCallTracker() {
   return {
     calls,
     fn<T extends Json>(name: string, value: T): () => Promise<T> {
-      return async () => {
+      return () => {
         calls.push(name);
-        return value;
+        return Promise.resolve(value);
       };
     },
   };
@@ -250,15 +249,15 @@ Deno.test("persist-before-resume: generator does not advance until write complet
   };
 
   function* workflow(): Workflow<string> {
-    yield* durableCall("step1", async () => {
+    yield* durableCall("step1", () => {
       order.push("execute:step1");
-      return "one";
+      return Promise.resolve("one" as const);
     });
     order.push("resumed:after-step1");
 
-    yield* durableCall("step2", async () => {
+    yield* durableCall("step2", () => {
       order.push("execute:step2");
-      return "two";
+      return Promise.resolve("two" as const);
     });
     order.push("resumed:after-step2");
 
@@ -333,9 +332,9 @@ Deno.test("golden run with error: records Close(err) event", async () => {
   const stream = new InMemoryStream();
 
   function* workflow(): Workflow<string> {
-    yield* durableCall("failingStep", async () => {
-      throw new Error("boom");
-    });
+    yield* durableCall("failingStep", () =>
+      Promise.reject(new Error("boom")),
+    );
     return "unreachable";
   }
 

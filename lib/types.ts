@@ -78,7 +78,7 @@ export type DurableEvent = Yield | Close;
  * The protocol uses { status: "ok" | "err" | "cancelled" }.
  * We re-declare Effection's shape here so types.ts has no Effection imports.
  */
-// TODO this hsould be replaced with Result from effection
+// TODO this should be replaced with Result from effection
 export type EffectionResult<T> =
   | { readonly ok: true; value: T }
   | { readonly ok: false; error: Error };

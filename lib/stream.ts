@@ -50,17 +50,18 @@ export class InMemoryStream implements DurableStream {
     this.events = [...initialEvents];
   }
 
-  async readAll(): Promise<DurableEvent[]> {
-    return [...this.events];
+  readAll(): Promise<DurableEvent[]> {
+    return Promise.resolve([...this.events]);
   }
 
-  async append(event: DurableEvent): Promise<void> {
+  append(event: DurableEvent): Promise<void> {
     if (this.injectFailure) {
-      throw this.injectFailure;
+      return Promise.reject(this.injectFailure);
     }
     this.onAppend?.(event);
     this.events.push(event);
     this.appendCount++;
+    return Promise.resolve();
   }
 
   /** Get a snapshot of current events (for test assertions). */

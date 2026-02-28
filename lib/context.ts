@@ -6,7 +6,7 @@
  * coroutineId and childCounter.
  */
 
-import { createContext } from "@effection/effection";
+import { createContext, type Context } from "@effection/effection";
 import type { ReplayIndex } from "./replay-index.ts";
 import type { DurableStream } from "./stream.ts";
 import type { CoroutineId } from "./types.ts";
@@ -26,4 +26,6 @@ export interface DurableContext {
  * Effection Context for durable execution state.
  * Set on the root scope by durableRun(); inherited by child scopes.
  */
-export const DurableCtx = createContext<DurableContext>("@effection/durable");
+export const DurableCtx: Context<DurableContext> = createContext<DurableContext>(
+  "@effection/durable",
+);

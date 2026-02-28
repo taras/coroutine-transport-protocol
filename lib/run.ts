@@ -12,7 +12,7 @@ import { createScope } from "@effection/effection";
 import { DurableCtx } from "./context.ts";
 import { EarlyReturnDivergenceError } from "./errors.ts";
 import { ReplayIndex } from "./replay-index.ts";
-import { serializeError } from "./serialize.ts";
+import { deserializeError, serializeError } from "./serialize.ts";
 import type { DurableStream } from "./stream.ts";
 import type { Close, Json, Workflow } from "./types.ts";
 
@@ -56,10 +56,7 @@ export async function durableRun<T extends Json | void>(
     if (closeEvent.result.status === "ok") {
       return closeEvent.result.value as T;
     } else if (closeEvent.result.status === "err") {
-      const err = new Error(closeEvent.result.error.message);
-      if (closeEvent.result.error.name) err.name = closeEvent.result.error.name;
-      if (closeEvent.result.error.stack) err.stack = closeEvent.result.error.stack;
-      throw err;
+      throw deserializeError(closeEvent.result.error);
     } else {
       throw new Error("Workflow was cancelled");
     }

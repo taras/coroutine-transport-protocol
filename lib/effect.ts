@@ -14,7 +14,7 @@ import {
   ContinuePastCloseDivergenceError,
   DivergenceError,
 } from "./errors.ts";
-import { protocolToEffection } from "./serialize.ts";
+import { protocolToEffection, serializeError } from "./serialize.ts";
 import type {
   DurableEffect,
   EffectDescription,
@@ -22,6 +22,9 @@ import type {
   Resolve,
   Result,
 } from "./types.ts";
+
+/** Effection void-ok result, used for no-op teardowns. */
+const VOID_OK: EffectionResult<void> = { ok: true, value: undefined as void };
 
 /**
  * Executor function signature for live execution.
@@ -32,7 +35,7 @@ import type {
  *
  * Returns a teardown function called during scope destruction/cancellation.
  */
-export type Executor<T> = (
+export type Executor = (
   resolve: (result: Result) => void,
   reject: (error: Error) => void,
 ) => () => void;
@@ -45,7 +48,7 @@ export type Executor<T> = (
  */
 export function createDurableEffect<T>(
   desc: EffectDescription,
-  execute: Executor<T>,
+  execute: Executor,
 ): DurableEffect<T> {
   return {
     description: `${desc.type}(${desc.name})`,
@@ -75,7 +78,7 @@ export function createDurableEffect<T>(
               desc,
             ),
           });
-          return (exit) => exit({ ok: true, value: undefined as void });
+          return (exit) => exit(VOID_OK);
         }
 
         // Consume the entry and advance cursor
@@ -84,7 +87,7 @@ export function createDurableEffect<T>(
         // Feed stored result synchronously — no I/O, no side effects.
         // Convert from protocol Result to Effection Result.
         resolve(protocolToEffection<T>(entry.result));
-        return (exit) => exit({ ok: true, value: undefined as void });
+        return (exit) => exit(VOID_OK);
       }
 
       // No replay entry. Check for continue-past-close divergence (§6.3).
@@ -99,49 +102,64 @@ export function createDurableEffect<T>(
             yieldCount,
           ),
         });
-        return (exit) => exit({ ok: true, value: undefined as void });
+        return (exit) => exit(VOID_OK);
       }
 
       // ── LIVE PATH ──
-      // Call the executor. On resolution, persist-before-resume (§5).
-      const teardown = execute(
-        (result: Result) => {
-          const event = {
-            type: "yield" as const,
-            coroutineId: ctx.coroutineId,
-            description: desc,
-            result,
-          };
-          // Strategy B: buffered write with deferred resume.
-          // The generator does not advance until the durable write completes.
-          ctx.stream.append(event).then(() => {
-            resolve(protocolToEffection<T>(result));
-          });
-        },
-        (error: Error) => {
-          const result: Result = {
-            status: "err",
-            error: { message: error.message, name: error.name, stack: error.stack },
-          };
-          const event = {
-            type: "yield" as const,
-            coroutineId: ctx.coroutineId,
-            description: desc,
-            result,
-          };
-          ctx.stream.append(event).then(() => {
-            resolve(protocolToEffection<T>(result));
-          });
-        },
-      );
+
+      /** Persist a Yield event then resume the generator. */
+      function persistAndResolve(result: Result): void {
+        const event = {
+          type: "yield" as const,
+          coroutineId: ctx.coroutineId,
+          description: desc,
+          result,
+        };
+        // Strategy B: buffered write with deferred resume.
+        // The generator does not advance until the durable write completes.
+        // If append rejects, deliver the error through Effection's normal
+        // error channel to avoid hanging the generator.
+        ctx.stream.append(event).then(
+          () => resolve(protocolToEffection<T>(result)),
+          (err) =>
+            resolve({
+              ok: false,
+              error: err instanceof Error ? err : new Error(String(err)),
+            }),
+        );
+      }
+
+      // Guard against synchronous throws from the executor. If execute()
+      // throws before returning a teardown function, we need to persist the
+      // error and resolve through the normal channel.
+      let teardown: () => void;
+      try {
+        teardown = execute(
+          (result: Result) => persistAndResolve(result),
+          (error: Error) => {
+            persistAndResolve({
+              status: "err",
+              error: serializeError(error),
+            });
+          },
+        );
+      } catch (e) {
+        const error = e instanceof Error ? e : new Error(String(e));
+        persistAndResolve({
+          status: "err",
+          error: serializeError(error),
+        });
+        return (exit) => exit(VOID_OK);
+      }
 
       // Return teardown that Effection calls during scope destruction
       return (exit: Resolve<EffectionResult<void>>) => {
         try {
           teardown();
-          exit({ ok: true, value: undefined as void });
+          exit(VOID_OK);
         } catch (e) {
-          exit({ ok: false, error: e as Error });
+          const error = e instanceof Error ? e : new Error(String(e));
+          exit({ ok: false, error });
         }
       };
     },
