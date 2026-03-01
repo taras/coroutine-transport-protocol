@@ -69,6 +69,10 @@ export {
 // Structured concurrency combinators
 export { durableAll, durableRace, durableSpawn } from "./combinators.ts";
 
+// Durable iteration
+export { durableEach } from "./each.ts";
+export type { DurableSource } from "./each.ts";
+
 // Entry point
 export { durableRun } from "./run.ts";
 export type { DurableRunOptions } from "./run.ts";

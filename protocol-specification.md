@@ -61,8 +61,9 @@ instructions from a priority queue, calls `iterator.next(value)` to
 advance the generator, and processes the yielded effect. The reducer is
 not a scheduler — it makes no decisions about which coroutine to run
 next. The next instruction is always the next item in the queue, ordered
-by scope depth (deeper scopes first), FIFO within a tier. This
-determinism is what makes replay possible.
+by scope depth (shallower scopes first — parent effects are entered
+before child effects), FIFO within a tier. This determinism is what
+makes replay possible.
 
 **Runtime.** The broader system that manages the lifecycle of scopes,
 coroutines, and the durable stream. The runtime encompasses the reducer
@@ -249,9 +250,11 @@ This means the reduce loop processes spawns in the same order as the original
 run. The per-parent counter increments in an identical sequence.
 
 **Property 4: Priority ordering is structural.** If the runtime uses a
-priority queue ordered by scope depth, priorities are determined by code
-structure (nesting depth), not by timing. Instructions at the same priority
-are processed in FIFO order within their tier.
+priority queue ordered by scope depth (lower depth = higher priority),
+priorities are determined by code structure (nesting depth), not by timing.
+Shallower scopes are dequeued first — when a parent and child effect are
+enqueued in the same tick, the parent is always entered first. Instructions
+at the same priority are processed in FIFO order within their tier.
 
 ### 3.3 Formal requirement
 

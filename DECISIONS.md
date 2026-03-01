@@ -586,3 +586,48 @@ Updated before completion of every phase and committed at the end of each phase.
 - **Consequences:** `lastOffset` is updated as a side effect of `readAll()`
   and `append()`. Nothing consumes it yet, but it's available for the
   tailing feature when implemented.
+
+## DEC-030: durableEach — pre-fetch pattern with context-based state sharing
+
+- **Phase:** 6 (Durable Iteration)
+- **Date:** 2026-02-28
+- **Context:** Need a durable iteration primitive for consuming a
+  `DurableSource<T>` (e.g., a message queue, paginated API) inside a
+  Workflow. Each item fetch must be journaled so iteration survives
+  crashes and replays from the journal.
+- **Decision:** Implement `durableEach(name, source)` / `durableEach.next()`
+  mirroring Effection's `each()` / `each.next()` pattern. Key choices:
+  1. **Pre-fetch pattern**: `durableEach()` fetches the first item,
+     returns a synchronous iterable. `durableEach.next()` fetches
+     subsequent items. This makes `for...of` work with durable effects.
+  2. **Context-based state sharing**: `DurableEachContext` Effection
+     context stores `{ name, source, current, advanced }`, shared
+     between `durableEach()` and `durableEach.next()` via `useScope()`.
+  3. **`{ value: T } | { done: true }` wrapper**: Stored in journal
+     to avoid null-as-done ambiguity (null is valid JSON).
+  4. **Single fetch helper** (`durableEachFetch`): Both initial and
+     subsequent fetches use the same helper with description
+     `{ type: "each", name }`. Same journal format, same replay path.
+  5. **Advance guard**: Runtime detection of missing
+     `yield* durableEach.next()` — iterator throws if re-entered
+     without advance. Prevents infinite loops on same item.
+  6. **Source teardown**: Both effect-level teardown (in
+     `createDurableEffect`) and scope-level cleanup (via `ensure()`)
+     call `source.close?.()`. Dual cleanup is safe for idempotent
+     close functions.
+  7. **Operation, not Workflow**: Both `durableEach` and
+     `durableEach.next()` use `useScope()` / `ensure()`, making them
+     `Operation<T>` at the type level. Consistent with combinators
+     (`durableSpawn`, `durableAll`, etc.).
+- **Rationale:** Mirrors Effection's `each()` API for developer
+  familiarity. The pre-fetch pattern is the only way to make `for...of`
+  work with async durable effects (synchronous iterator protocol
+  requires the value to be available when `next()` is called). The
+  `{ value: T } | { done: true }` wrapper prevents the null sentinel
+  problem documented in the integration spec §12.6.
+- **Consequences:** Each iteration produces one Yield event in the
+  journal. Journal size grows linearly with items consumed. For
+  long-running streams, a future Continue-As-New feature (§15.2) or
+  cursor-based checkpointing will bound journal growth. Nested
+  `durableEach` calls require separate child scopes (inner clobbers
+  outer context).

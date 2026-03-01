@@ -29,12 +29,13 @@ core replay (Tier 1), divergence detection (Tier 2), structured concurrency
 - The Durable Streams protocol provides a strong backend fit (see companion
   document `durable-streams.md`).
 
-**Implementation artifacts:** `lib/` contains 9 modules (types, replay-index,
-effect, operations, combinators, run, context, stream, serialize) plus
-`mod.ts` as the public API barrel. `test/` contains 6 test files with 50+
-tests across types, replay-index, durable-run (Tier 1), divergence (Tier 2),
-structured-concurrency (Tier 3), and deterministic-id (Tier 4). 18
-architectural decisions recorded in `DECISIONS.md`.
+**Implementation artifacts:** `lib/` contains 10 modules (types, replay-index,
+effect, operations, combinators, run, context, stream, http-stream, serialize)
+plus `mod.ts` as the public API barrel. `test/` contains 7 test files with
+60+ tests across types, replay-index, durable-run (Tier 1), divergence
+(Tier 2), structured-concurrency (Tier 3), deterministic-id (Tier 4), and
+http-stream (backend adapter). 29 architectural decisions recorded in
+`DECISIONS.md`.
 
 ---
 
@@ -104,7 +105,7 @@ runtime which scopes completed before a crash and which need re-execution.
 ```typescript
 class Reducer {
   reducing = false;
-  readonly queue = new InstructionQueue();  // priority queue, deeper scopes first
+  readonly queue = new InstructionQueue();  // min-heap priority queue, shallower scopes first
 
   reduce = (instruction: Instruction) => {
     this.queue.enqueue(instruction);
@@ -135,8 +136,8 @@ Key properties:
   `routine.next(result)` from a callback, which re-enters `reduce()`.
 - **Re-entrant safe.** If `reduce()` is already running, the instruction is
   enqueued and the outer loop picks it up.
-- **Priority ordered.** Deeper scopes run first (FIFO within a tier). This
-  is structural, not timing-dependent — it's deterministic.
+- **Priority ordered.** Shallower (parent) scopes run first (FIFO within a tier).
+  This is structural, not timing-dependent — it's deterministic.
 
 ### 3.2 The Effect interface
 
@@ -1093,7 +1094,7 @@ its result is JSON-serializable.
 ## 12. Design questions — status
 
 Most questions from the initial analysis have been resolved through
-implementation. Decisions are recorded in `DECISIONS.md` (18 entries).
+implementation. Decisions are recorded in `DECISIONS.md` (29 entries).
 Key validations:
 
 | Question | Status | Decision |
@@ -1104,11 +1105,13 @@ Key validations:
 | Replay/live dispatch location | ✅ Resolved | Inside `enter()`, no reducer changes (DEC-014) |
 | Persist-before-resume strategy | ✅ Resolved | Strategy B — async append + deferred resolve (DEC-017) |
 | Serialization boundary | ✅ Resolved | `T extends Json` type constraint (DEC-018) |
-| DurableStream interface | ✅ Resolved | `readAll()` + `append()`, InMemoryStream for tests |
+| DurableStream interface | ✅ Resolved | `readAll()` + `append()`, InMemoryStream for tests, HttpDurableStream for production |
 | Terminal divergence detection | ✅ Resolved | Both cases implemented with 3 error classes (DEC-008) |
 | durableSpawn implementation | ✅ Resolved | Operations using Effection's native spawn/all/race |
-| Batch persistence | ⏳ Deferred | Needed for `all()`/`race()`, not yet in scope |
-| Durable `each()` | ⏳ Future | Design target for long-running consumption |
+| HTTP backend adapter | ✅ Resolved | Raw fetch writes, promise chain serialization, epoch fencing (DEC-026–029) |
+| Batch persistence | ⏳ Deferred | Optimization for concurrent children, not blocking correctness. See §15.1 |
+| Durable `each()` | ⏳ Future | Design exploration in §12.6 — Option A (yield-per-item) as starting point |
+| Continue-As-New | ⏳ Future | Journal compaction for long-running loops. Tightly coupled with durableEach. See §15.2 |
 
 ### 12.1 Structured concurrency combinators (resolved)
 
@@ -1191,7 +1194,7 @@ Error serialization is implemented in `lib/serialize.ts` with
 Remaining design space: tagged encoding for Dates/BigInts could be added
 as a future `DurableCodec` extension without changing the core protocol.
 
-### 12.3 DurableStream interface (resolved)
+### 12.3 DurableStream interface (resolved) and HttpDurableStream backend
 
 Implemented in `lib/stream.ts` with the minimal interface:
 
@@ -1204,10 +1207,82 @@ interface DurableStream {
 
 `InMemoryStream` implements this for testing, with hooks for tracking
 append counts, injecting failures, and observing append ordering (used
-by the persist-before-resume test). The Durable Streams protocol
-(see `durable-streams.md`) maps cleanly to this interface for production
-use — `append()` maps to an HTTP POST with `await flush()`, and
-`readAll()` maps to a catch-up read from offset `-1`.
+by the persist-before-resume test).
+
+`HttpDurableStream` (`lib/http-stream.ts`) implements this for production
+use, backed by HTTP calls to a Durable Streams server. Key design
+decisions (DEC-026 through DEC-029):
+
+- **Raw `fetch()` for writes, not IdempotentProducer** (DEC-026). The
+  producer's fire-and-forget model is wrong for persist-before-resume.
+  Raw fetch gives full control over the request/response cycle and
+  captures `Stream-Next-Offset` from every response.
+- **Promise chain serialization for concurrent appends** (DEC-027).
+  Sequence numbers assigned synchronously, HTTP calls chained behind
+  `this.pending` to prevent out-of-order arrival.
+- **Close events in finally are best-effort** (DEC-028). Missing Close
+  events mean re-execution on replay, which is idempotent.
+- **`lastOffset` tracked from every response** (DEC-029). This is the
+  resumption point for future `tail()` calls. Not consumed yet but
+  available for the tailing feature.
+
+All unexpected HTTP statuses (including transient 500/503) are treated
+as fatal, setting `this.fatalError` so future appends fail-fast. This is
+the safe choice when the sequence state is uncertain — a failed append
+may or may not have persisted, so continuing with the next seq number
+risks a 409 gap. A future version could add retry-with-same-seq logic
+for transient errors, but that requires careful handling of the ambiguity
+window.
+
+Tests: `test/http-stream_test.ts` — 11 tests against a real
+`DurableStreamTestServer`, covering round-trip, empty reads, idempotent
+dedup, epoch fencing, full `durableRun`, replay, concurrent appends via
+`durableAll`, network errors, offset tracking, fail-fast, and error
+preservation.
+
+#### Verified: `readAll()` response shape ✓
+
+`HttpDurableStream.readAll()` uses `stream()` from
+`@durable-streams/client@0.2.1`. Both assumptions have been verified
+by inspecting the client library source:
+
+1. **Wire format — confirmed.** `stream()` returns a `StreamResponseImpl`.
+   `res.json()` returns a proper JSON array (`Content-Type: application/json`),
+   not NDJSON. `res.json()` → `DurableEvent[]` works correctly.
+
+2. **Client library API shape — confirmed.** `res.offset` is a prototype
+   getter on `StreamResponseImpl` that returns the value of the
+   `Stream-Next-Offset` response header. No need for manual header access.
+
+Both assumptions hold. The current `readAll()` implementation is correct.
+Documented in `lib/http-stream.ts` (commit `55b27cb`).
+
+#### Future interface evolution
+
+The `DurableStream` interface is deliberately minimal. Future features
+add methods without changing existing ones:
+
+```typescript
+interface DurableStream {
+  readAll(): Promise<DurableEvent[]>;           // catch-up (exists)
+  append(event: DurableEvent): Promise<void>;   // write (exists)
+  tail(offset: string): AsyncIterable<DurableEvent>;  // future: SSE/long-poll
+  readFrom(offset: string): Promise<DurableEvent[]>;  // future: cursor-based
+}
+```
+
+`readAll()` stays unchanged — it's the startup catch-up for building the
+ReplayIndex. `tail()` watches for live events after catch-up (needed for
+external workflow observers and multi-worker coordination). `readFrom()`
+is cursor-based partial reads (needed for `durableEach` checkpoint
+resumption). Both are additive — writes are always HTTP POST regardless
+of how you read. The `lastOffset` field already tracked on
+`HttpDurableStream` is the resumption point for both.
+
+The Durable Streams protocol explicitly supports this transition: "catch
+up then tail" is a first-class pattern where you read from offset `-1`,
+get `Stream-Up-To-Date: true`, then switch to `?live=sse` or
+`?live=long-poll` at your last offset.
 
 ### 12.4 Batch persistence (Strategy C)
 
@@ -1234,24 +1309,332 @@ Three distinct error classes share `name = "DivergenceError"` for
 catch-all handling but carry different diagnostic fields for precise
 `instanceof` checks.
 
-### 12.6 Durable `each()` for long-running consumption
+### 12.6 Durable `each()` — design and implementation plan
 
 Charles's example showed the powerful implication: in a durable workflow,
 each iteration of a loop can run on a different VM. This requires a durable
-iteration primitive — something like a durable subscription that checkpoints
-its position:
+iteration primitive that checkpoints its position after each item.
+
+#### The `for...of` constraint
+
+JavaScript's `for...of` calls `iterator.next()` synchronously. Inside a
+generator, there is no opportunity to yield a DurableEffect between the
+`for...of` calling `next()` and the loop body receiving the value. This
+means the naive design — where each `next()` call is itself a DurableEffect
+— cannot use `for...of`.
+
+The solution is the **pre-fetch pattern**: fetch the next item *before*
+the `for...of` iterator is re-entered. The synchronous `next()` just
+returns an already-fetched value.
+
+#### User-facing API
+
+Consistent with Effection's `each()` / `each.next()` pattern:
 
 ```typescript
 function* processQueue(): Workflow<void> {
-  for (let message of yield* durableEach(messageQueue)) {
-    yield* durableCall("process", () => process(message));
-    yield* durableEach.next();
+  for (let msg of yield* durableEach("queue", source)) {
+    yield* durableCall("process", () => process(msg));
+    yield* durableEach.next();  // checkpoint + pre-fetch next item
     // crash here → resume picks up at next message
   }
 }
 ```
 
-This is a future concern but worth noting as a design target.
+How the cycle works:
+
+1. `yield* durableEach("queue", source)` — yields a DurableEffect that
+   fetches item 1 from the source (or replays it from the journal).
+   Stores state in an Effection context. Returns a synchronous iterable.
+
+2. `for (let msg of yield* ...)` — calls the iterable's `next()`
+   synchronously. The iterator is a generator: `while (state.current
+   !== done) { yield state.current; }`. It yields the pre-fetched
+   item 1.
+
+3. Loop body runs — `yield* durableCall(...)` journals the processing.
+
+4. `yield* durableEach.next()` — reads state from Effection context,
+   yields a DurableEffect that fetches item 2 from the source (or
+   replays from journal). Updates `state.current`. Sets
+   `state.advanced = true`.
+
+5. Back to `for...of` — calls the iterator's synchronous `next()`,
+   re-enters the while loop, sees `state.current` is item 2, yields it.
+
+6. When the source is exhausted, `yield* durableEach.next()` sets
+   `state.current` to the done sentinel. The while loop exits,
+   `for...of` sees `{ done: true }`, loop ends.
+
+#### Advance guard
+
+Without `yield* durableEach.next()`, the `for...of` spins forever on
+the same item — `state.current` never advances. This is the most obvious
+footgun in the API, so `durableEach` detects it at runtime using an
+`advanced` flag on the shared state (see the implementation sketch
+below for the full code).
+
+The flag cycle: iterator yields → sets `advanced = false` → loop body
+→ `yield* durableEach.next()` sets `advanced = true` + fetches →
+iterator re-enters while → checks `advanced` → yields next item. If the
+iterator is re-entered with `advanced` still false, it throws
+immediately with a message telling the developer exactly what to do.
+
+Edge cases:
+
+- **`break` or `return` inside the loop.** The iterator isn't
+  re-entered, so the check never fires. Legitimate early exit works.
+- **`continue` without `durableEach.next()`.** The iterator re-enters,
+  sees `advanced` is false, throws. This is correct — skipping without
+  checkpointing means a crash would re-deliver the skipped item,
+  violating the "resume at next unconsumed item" contract. To skip
+  an item, call `yield* durableEach.next()` before `continue`.
+
+#### Types
+
+```typescript
+/** Source of items for durable iteration. */
+interface DurableSource<T extends Json> {
+  /** Read the next item, blocking until available. */
+  next(): Promise<{ value: T } | { done: true }>;
+  /** Teardown — called on cancellation or completion. */
+  close?(): void;
+}
+
+/** State stored in Effection context, shared between durableEach and durableEach.next(). */
+interface DurableEachState<T extends Json> {
+  name: string;
+  source: DurableSource<T>;
+  current: T | typeof DONE;
+  advanced: boolean;
+}
+```
+
+Note: `DurableSource.next()` returns `{ value: T } | { done: true }`
+rather than `T | null` because `null` is valid JSON — a source that
+legitimately produces null items would signal false exhaustion with a
+null sentinel.
+
+The optional `close()` method handles teardown on cancellation. Without
+it, if the workflow is cancelled while `source.next()` is awaiting
+(long-poll on a queue, database cursor), the pending read holds a
+connection open indefinitely. The `createDurableEffect` teardown
+function should call `source.close?.()`.
+
+#### Journal shape
+
+Each `yield* durableEach.next()` and the initial fetch in `yield* durableEach()`
+produce identical Yield events:
+
+```
+[0] yield root  { type: "each", name: "queue" }  result: { status: "ok", value: { value: msg1 } }
+[1] yield root  { type: "call", name: "process" } result: { status: "ok" }
+[2] yield root  { type: "each", name: "queue" }  result: { status: "ok", value: { value: msg2 } }
+[3] yield root  { type: "call", name: "process" } result: { status: "ok" }
+[4] yield root  { type: "each", name: "queue" }  result: { status: "ok", value: { done: true } }
+[5] close root  result: { status: "ok" }
+```
+
+The `{ value: T } | { done: true }` wrapper is stored directly in
+the result's value field. Position-based divergence detection handles
+repeated identical descriptions (`{ type: "each", name: "queue" }`)
+correctly — matching is by cursor position, not description uniqueness.
+
+On replay, stored items are fed back from the journal without
+re-reading from the source. The source's `next()` is never called
+during replay.
+
+#### Implementation sketch
+
+```typescript
+// Sentinel for source exhaustion (not exported)
+const DONE = Symbol("durableEach.done");
+type ItemOrDone<T> = T | typeof DONE;
+
+// Effection context for sharing state between durableEach and durableEach.next()
+const DurableEachContext = createContext<DurableEachState<any>>(
+  "durableEach.state",
+);
+
+function durableEachFetch<T extends Json>(
+  name: string,
+  source: DurableSource<T>,
+): Workflow<ItemOrDone<T>> {
+  return function* () {
+    const result = (yield createDurableEffect<{ value: T } | { done: true }>(
+      { type: "each", name },
+      (resolve) => {
+        source.next().then(
+          (item) => {
+            if ("done" in item) {
+              resolve({ status: "ok", value: { done: true } });
+            } else {
+              resolve({ status: "ok", value: { value: item.value } });
+            }
+          },
+          (error) => {
+            resolve({
+              status: "err",
+              error: serializeError(
+                error instanceof Error ? error : new Error(String(error)),
+              ),
+            });
+          },
+        );
+        return () => source.close?.();
+      },
+    )) as { value: T } | { done: true };
+
+    if ("done" in result) return DONE;
+    return result.value;
+  }();
+}
+
+function* durableEach<T extends Json>(
+  name: string,
+  source: DurableSource<T>,
+): Workflow<Iterable<T>> {
+  // Durable fetch of first item — journaled as a Yield event
+  const first: ItemOrDone<T> = yield* durableEachFetch(name, source);
+
+  // Store state in Effection context for durableEach.next() to access
+  const scope = yield* useScope();
+  const state: DurableEachState<T> = {
+    name,
+    source,
+    current: first,
+    advanced: true,
+  };
+  scope.set(DurableEachContext, state);
+
+  return {
+    *[Symbol.iterator]() {
+      while (state.current !== DONE) {
+        if (!state.advanced) {
+          throw new Error(
+            `durableEach("${name}"): yield* durableEach.next() must be ` +
+            `called before the next iteration. Each loop body must end ` +
+            `with yield* durableEach.next() to checkpoint progress and ` +
+            `fetch the next item.`
+          );
+        }
+        state.advanced = false;
+        yield state.current as T;
+      }
+    },
+  };
+}
+
+// Static method — mirrors Effection's each.next() pattern
+durableEach.next = function* <T extends Json>(): Operation<void> {
+  const scope = yield* useScope();
+  const state = scope.expect(DurableEachContext) as DurableEachState<T>;
+  state.advanced = true;
+  state.current = yield* durableEachFetch<T>(state.name, state.source);
+};
+```
+
+Key design choices:
+
+- **Context-based state sharing.** Consistent with Effection's
+  `each()` / `each.next()` pattern. State is stored in an Effection
+  context via `useScope()`, and `durableEach.next()` reads it back
+  from the same context. This means `durableEach.next()` is an
+  `Operation<void>` (not `Workflow<void>`) because `useScope()` is
+  an infrastructure effect. This matches Effection's `each.next()`
+  which is also an Operation.
+
+- **`durableEach` itself uses `useScope()`.** This means it too
+  becomes an Operation at the type level. In practice, the only
+  infrastructure effect is context setup — all durable effects still
+  go through `createDurableEffect`. The type widening is acceptable
+  for API consistency.
+
+- **Symbol sentinel for exhaustion.** `DONE` is a private Symbol,
+  not `null` or `undefined`. Cannot collide with any JSON value from
+  the source.
+
+- **Source teardown in effect teardown.** The `createDurableEffect`
+  teardown function calls `source.close?.()`, so cancellation during
+  a pending `source.next()` can clean up (abort fetch, close cursor,
+  release connection).
+
+- **durableEachFetch is the only DurableEffect.** Both the initial
+  fetch (inside `durableEach`) and subsequent fetches (inside
+  `durableEach.next()`) go through the same helper. Same effect
+  description, same journal format, same replay path.
+
+#### Three approaches to checkpointing (background)
+
+The implementation above uses **Option A: yield-per-item**. Two
+alternative approaches exist for future consideration:
+
+**Option B: Cursor checkpoint.** Instead of recording each item,
+record a cursor/offset that represents "I've processed up to here."
+On replay, the runtime reads from the cursor position, not from the
+start. Requires the source to support cursor-based reads — which maps
+to the Durable Streams `readFrom(offset)` pattern or any external
+system with offset semantics (Kafka consumer offsets, database
+sequences, SQS receipt handles). Smaller journals, faster replay.
+But the source must be re-readable from a position, which not all
+sources support (transient webhook streams, one-shot HTTP responses).
+
+**Option C: Hybrid with Continue-As-New.** Record items in the
+journal (like A), but periodically compact by starting a new execution
+with a fresh journal. After N iterations, `durableRun` returns a
+continuation token (cursor position + accumulated state), and the
+scheduler starts a new execution seeded with that token. Works with
+any source. Bounds journal growth. But requires Continue-As-New as
+a separate feature (see §15.2).
+
+Option A is the right starting point: no new `DurableStream` methods
+needed, no new features required. The unbounded journal limitation is
+acceptable for initial use cases with bounded iteration counts (process
+a batch of N items, not an infinite stream). Add `readFrom(offset)` and
+Continue-As-New as follow-on work when journal size becomes a practical
+constraint.
+
+#### Interaction with durableAll
+
+When durableEach feeds items into parallel processing pipelines:
+
+```typescript
+function* fanOut(): Workflow<void> {
+  const batch: Json[] = [];
+  for (let msg of yield* durableEach("queue", source)) {
+    batch.push(msg);
+    if (batch.length === 10) {
+      yield* durableAll(batch.map(m =>
+        function*() { yield* durableCall("process", () => process(m)); }
+      ));
+      batch.length = 0;
+    }
+    yield* durableEach.next();
+  }
+}
+```
+
+This produces bursts of concurrent appends (10 children resolving in
+the same tick), making batch persistence (Strategy C, §15.1) a
+performance concern. Without it, each child's Yield event is a separate
+HTTP POST awaited sequentially via the promise chain.
+
+#### Interaction with Effection's `each()`
+
+Effection's `each(subscription)` consumes streams within structured
+concurrency using a channel-based protocol. `durableEach` mirrors the
+same API pattern — `each()` returns an iterable, `each.next()` is a
+static method that advances via context — but cannot wrap `each()`
+directly because `each()` yields infrastructure effects
+(`Effect<unknown>`, not `DurableEffect<unknown>`). The type constraint
+rejects it.
+
+`durableEach` re-implements the pre-fetch pattern using `useScope()`
+and Effection contexts, matching `each()`'s ergonomics while staying
+within the durable type system. The two serve different purposes:
+Effection's `each()` is for reactive stream consumption within a scope;
+`durableEach` is for durable checkpoint-based consumption that survives
+crashes.
 
 ---
 
@@ -1273,7 +1656,7 @@ This is a future concern but worth noting as a design target.
 
 ## 14. Progress and next steps
 
-### Completed (Tier 1-4)
+### Completed (Tier 1-4 + HTTP backend)
 
 1. ~~Validate type system~~ — `Workflow<T>` rejects `Operation` usage at
    compile time (DEC-009, `test/types_test.ts`).
@@ -1299,23 +1682,148 @@ This is a future concern but worth noting as a design target.
 10. ~~Run Tier 4 tests~~ — Deterministic coroutine IDs across runs,
     live vs replay, nested hierarchical IDs, race IDs — all passing
     (`test/deterministic-id_test.ts`).
+11. ~~Durable Streams backend adapter~~ — `HttpDurableStream`
+    (`lib/http-stream.ts`) with raw fetch writes, promise chain
+    serialization, epoch fencing, offset tracking. 11 tests against
+    real server (`test/http-stream_test.ts`). DEC-026 through DEC-029.
 
-11. ~~Durable Streams backend adapter~~ — `HttpDurableStream` implements
-    `DurableStream` over HTTP with raw fetch for appends, promise chain
-    serialization, fail-fast on fatal errors, offset tracking
-    (`lib/http-stream.ts`, `test/http-stream_test.ts`, DEC-026–029).
-12. ~~Cleanup pass~~ — effection-pro code review: hardened error handling
-    (all uncertain write outcomes fatal), preserved original errors in
-    `durableRun` catch block, `readAll()` honors custom fetch, 2 new
-    tests (73 total).
+### ~~Immediate: verify `readAll()` response shape~~ ✓ Complete
+
+Verified in a prior session. `stream()` from `@durable-streams/client@0.2.1`
+returns `StreamResponseImpl` where `res.json()` returns a JSON array and
+`res.offset` is a prototype getter for the `Stream-Next-Offset` header.
+Both assumptions confirmed correct. See §12.3 for details.
 
 ### Next
 
-13. **Batch persistence (Strategy C).** Optimize concurrent child effects
-    by batching writes within a single reduce cycle.
+12. **Implement `durableEach`.** Durable iteration primitive for
+    long-running consumption. Starting point: Option A (yield-per-item)
+    with the existing interface. See §12.6 for design exploration.
 
-14. **Implement `durableEach`.** Durable iteration primitive for
-    long-running consumption (message queues, event streams). Each
-    iteration checkpoints its position — crash recovery resumes at
-    the next unconsumed item, enabling each loop iteration to run
-    on a different VM. See §12.6.
+### Future improvements
+
+13. **Batch persistence (Strategy C).** Optimize concurrent child effects
+    by batching writes within a single reduce cycle. Becomes a performance
+    concern when `durableEach` feeds items into `durableAll` parallel
+    processing. See §12.4 and §15.1.
+
+14. **Continue-As-New.** Periodic journal compaction for long-running
+    `durableEach` loops. Bounds journal growth. See §15.2.
+
+15. **SSE/long-poll tailing.** `tail(offset)` method on `DurableStream`
+    for watching live events — needed for external workflow observers
+    and multi-worker coordination. See §12.3 on future interface
+    evolution. Additive, no changes to existing methods.
+
+---
+
+## 15. Future architecture considerations
+
+### 15.1 Batch persistence (Strategy C)
+
+During `all()` with multiple children, several effects may resolve in the
+same reducer tick (especially during replay-to-live transition). The spec's
+Strategy C suggests batching writes — accumulating Yield events into a
+buffer on the `DurableContext` and flushing at the end of each reduce cycle.
+
+The current implementation uses Strategy B (async append + deferred resolve)
+on every individual effect. For the HTTP backend, this means each child's
+Yield event is a separate HTTP POST, serialized by the promise chain
+(DEC-027). With N concurrent children, that's N sequential round-trips.
+
+Strategy C would batch these into a single HTTP POST using the Durable
+Streams `lingerMs`-style batching (or a single POST with multiple JSON
+messages). The batch is one sequence number — atomic at the batch level.
+This amortizes latency but requires changes to `createDurableEffect`:
+instead of calling `stream.append()` directly, it would enqueue to a buffer
+and the buffer would flush after the synchronous reduce cycle completes.
+
+The ordering constraint for batching: Close events must still be appended
+strictly after the child's Yield events (causal ordering, spec §8). Within
+a batch of sibling Yield events, ordering doesn't matter — they're from
+independent coroutines.
+
+Not blocking for correctness. Only relevant for throughput with concurrent
+children.
+
+### 15.2 Continue-As-New
+
+For `durableEach` loops processing unbounded streams, the journal grows
+without limit. Continue-As-New is the standard solution from Temporal and
+similar systems: after N iterations (or N bytes of journal), the runtime
+terminates the current execution and starts a new one seeded with a
+continuation token — the current cursor position plus any accumulated state.
+
+This requires:
+
+- **durableRun recognizing a continuation signal.** The workflow returns
+  a special value or throws a `ContinueAsNew` error that `durableRun`
+  catches. Instead of writing `Close(ok)`, it writes a continuation
+  marker and returns the seed state.
+- **A scheduling layer.** Something outside `durableRun` that creates
+  a new stream, seeds the new execution, and links the executions for
+  observability. This might be a `DurableScheduler` or just a loop
+  around `durableRun`.
+- **Stream lifecycle management.** Old streams can be archived or deleted
+  after the continuation starts. The Durable Streams protocol supports
+  TTL-based retention but no compaction — Continue-As-New is the
+  compaction strategy.
+
+Continue-As-New is a significant feature. It touches `durableRun` (the
+continuation signal), the stream interface (creating new streams), and
+potentially a new scheduler layer. Design it alongside `durableEach`
+since they're tightly coupled — `durableEach` without Continue-As-New
+is limited to bounded iteration counts.
+
+### 15.3 Uncancellable contexts for Close events
+
+`runDurableChild` appends Close events in a `finally` block via
+`yield* call(() => stream.append(...))`. During parent scope teardown,
+this async operation can be interrupted by Effection's cancellation
+(DEC-028). The protocol handles this gracefully — a missing Close just
+means re-execution on replay — but it's a correctness gap for
+observability (the journal may not reflect the child's actual terminal
+state).
+
+If Effection adds an uncancellable context in a future version (an
+`uncancellable(() => ...)` wrapper that suppresses `iterator.return()`
+during execution), `runDurableChild`'s finally block should use it.
+This would guarantee Close events are always persisted, eliminating
+the re-execution window.
+
+### 15.4 Stream naming conventions
+
+The HTTP adapter uses `${baseUrl}/${streamId}` as the URL. In a
+multi-tenant or multi-workflow-type deployment, a naming convention
+prevents collisions:
+
+- `workflows/${workflowType}/${executionId}` — per-execution stream
+  with type namespace
+- `tenant/${tenantId}/workflows/${type}/${id}` — multi-tenant isolation
+
+The Durable Streams protocol uses URL-path-based naming with no built-in
+namespacing. Tenant isolation requires path-prefix scoping or separate
+server instances. Worth deciding before production deployment but not
+blocking for development.
+
+### 15.5 Transient error retry for HTTP appends
+
+The current `HttpDurableStream` treats all unexpected HTTP statuses
+(including 500, 503) as fatal. This is the safe choice when the
+sequence state is uncertain — a failed append may or may not have
+persisted on the server.
+
+A future version could add retry-with-same-seq logic for transient
+errors:
+
+1. On 500/503/timeout, retry the same `(Id, Epoch, Seq)` tuple.
+2. If the server returns 200, the retry succeeded (first write).
+3. If the server returns 204, the original append did persist
+   (idempotent success).
+4. Both outcomes are safe — the seq counter doesn't advance until
+   the append is confirmed.
+
+This requires distinguishing transient errors (retry-safe) from
+permanent errors (StaleEpochError, SequenceGapError — fatal). The
+current code's `fatalError` flag would need to become a discriminated
+error state.
