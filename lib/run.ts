@@ -9,7 +9,7 @@
  */
 
 import { createScope } from "@effection/effection";
-import type { Operation } from "@effection/effection";
+import type { Operation, Scope } from "@effection/effection";
 import { DurableCtx } from "./context.ts";
 import { EarlyReturnDivergenceError } from "./errors.ts";
 import { ReplayIndex } from "./replay-index.ts";
@@ -25,6 +25,15 @@ export interface DurableRunOptions {
   stream: DurableStream;
   /** Coroutine ID for the root workflow. Defaults to "root". */
   coroutineId?: string;
+  /**
+   * Optional setup callback invoked with the Effection scope before the
+   * workflow runs. Use this to install middleware (e.g., divergence
+   * policy overrides via `scope.around(Divergence, ...)`).
+   *
+   * The callback receives the raw Scope, not a generator context, so
+   * only synchronous scope methods (set, around) are available.
+   */
+  setup?: (scope: Scope) => void;
 }
 
 /**
@@ -43,7 +52,7 @@ export async function durableRun<T extends Json | void>(
   workflow: () => Workflow<T> | Operation<T>,
   options: DurableRunOptions,
 ): Promise<T> {
-  const { stream, coroutineId = "root" } = options;
+  const { stream, coroutineId = "root", setup } = options;
 
   // Read all events and build replay index
   const events = await stream.readAll();
@@ -73,6 +82,13 @@ export async function durableRun<T extends Json | void>(
     childCounter: 0,
   });
 
+  // Allow callers to install middleware or configure the scope before
+  // the workflow executes. This is the extension point for divergence
+  // policy overrides (DEC-031).
+  if (setup) {
+    setup(scope);
+  }
+
   try {
     // Workflow<T> is structurally assignable to Operation<T>, so
     // scope.run() accepts it directly — no cast needed.
@@ -81,11 +97,15 @@ export async function durableRun<T extends Json | void>(
 
     // §6.3: Check for early return divergence.
     // If the generator returned but the replay index has unconsumed yields,
-    // the workflow has diverged.
-    const cursor = replayIndex.getCursor(coroutineId);
-    const totalYields = replayIndex.yieldCount(coroutineId);
-    if (cursor < totalYields) {
-      throw new EarlyReturnDivergenceError(coroutineId, cursor, totalYields);
+    // the workflow has diverged. Skip this check when replay has been
+    // disabled (run-live mode) — the workflow intentionally diverged and
+    // the Divergence API already approved it.
+    if (!replayIndex.isReplayDisabled(coroutineId)) {
+      const cursor = replayIndex.getCursor(coroutineId);
+      const totalYields = replayIndex.yieldCount(coroutineId);
+      if (cursor < totalYields) {
+        throw new EarlyReturnDivergenceError(coroutineId, cursor, totalYields);
+      }
     }
 
     // Append Close(ok) event

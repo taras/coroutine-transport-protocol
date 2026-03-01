@@ -1,9 +1,14 @@
 /**
  * Protocol types for the two-event durable execution protocol.
  *
- * These types are the fixed contract defined by protocol-specification.md.
- * They do not depend on Effection internals.
+ * Protocol types (Json, Result, DurableEvent, etc.) are the fixed contract
+ * defined by protocol-specification.md and do not depend on Effection.
+ *
+ * Effection integration types (CoroutineView, DurableEffect, Workflow) are
+ * in the second section and bridge the protocol with Effection's runtime.
  */
+
+import type { Scope } from "@effection/effection";
 
 /** Any JSON-serializable value. */
 export type Json =
@@ -89,16 +94,17 @@ export type EffectionResult<T> =
 export type Resolve<T> = (value: T) => void;
 
 /**
- * Minimal view of Effection's Coroutine — only the fields we need.
+ * View of Effection's Coroutine — the fields we need from enter().
+ *
  * The full Coroutine type is internal to Effection (@ignore), but
- * enter() receives it. We need `scope` to read DurableContext.
+ * enter() receives it. We need `scope` to read DurableContext and
+ * to invoke the Divergence API via Api.invoke(scope, ...).
+ *
+ * Uses the full Scope type because the Divergence API's invoke()
+ * requires scope.around() support for middleware dispatch (DEC-031).
  */
 export interface CoroutineView {
-  scope: {
-    get<T>(context: { name: string; defaultValue?: T }): T | undefined;
-    expect<T>(context: { name: string }): T;
-    set<T>(context: { name: string }, value: T): T;
-  };
+  scope: Scope;
 }
 
 /**

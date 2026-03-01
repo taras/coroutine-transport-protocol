@@ -16,6 +16,8 @@ export class ReplayIndex {
   private yields = new Map<CoroutineId, YieldEntry[]>();
   private cursors = new Map<CoroutineId, number>();
   private closes = new Map<CoroutineId, Close>();
+  /** Coroutines where replay has been disabled (run-live mode). */
+  private disabled = new Set<CoroutineId>();
 
   constructor(events: DurableEvent[]) {
     for (const event of events) {
@@ -34,10 +36,27 @@ export class ReplayIndex {
   }
 
   /**
+   * Disable replay for a coroutine (run-live mode).
+   *
+   * Once disabled, peekYield() returns undefined and hasClose() returns
+   * false for this coroutine, so all subsequent effects execute live
+   * and no further divergence checks are triggered.
+   */
+  disableReplay(coroutineId: CoroutineId): void {
+    this.disabled.add(coroutineId);
+  }
+
+  /** Returns true if replay has been disabled for this coroutine. */
+  isReplayDisabled(coroutineId: CoroutineId): boolean {
+    return this.disabled.has(coroutineId);
+  }
+
+  /**
    * Returns the next unconsumed yield for this coroutine,
-   * or undefined if the cursor is past the end.
+   * or undefined if the cursor is past the end or replay is disabled.
    */
   peekYield(coroutineId: CoroutineId): YieldEntry | undefined {
+    if (this.disabled.has(coroutineId)) return undefined;
     const list = this.yields.get(coroutineId);
     const cursor = this.cursors.get(coroutineId) ?? 0;
     return list?.[cursor];
@@ -54,8 +73,9 @@ export class ReplayIndex {
     return this.cursors.get(coroutineId) ?? 0;
   }
 
-  /** Returns true if a Close event exists for this coroutine. */
+  /** Returns true if a Close event exists for this coroutine (and replay is not disabled). */
   hasClose(coroutineId: CoroutineId): boolean {
+    if (this.disabled.has(coroutineId)) return false;
     return this.closes.has(coroutineId);
   }
 
@@ -68,8 +88,11 @@ export class ReplayIndex {
    * Returns true if the cursor for this coroutine has been fully consumed
    * AND a Close event exists. This means the coroutine completed in a
    * previous run and can be treated as fully replayed.
+   *
+   * Returns false if replay is disabled (run-live mode).
    */
   isFullyReplayed(coroutineId: CoroutineId): boolean {
+    if (this.disabled.has(coroutineId)) return false;
     return this.peekYield(coroutineId) === undefined && this.hasClose(coroutineId);
   }
 

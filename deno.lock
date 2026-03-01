@@ -5,7 +5,8 @@
     "jsr:@std/assert@^1.0.19": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.12",
     "npm:@durable-streams/client@0.2.1": "0.2.1",
-    "npm:@durable-streams/server@0.2.1": "0.2.1"
+    "npm:@durable-streams/server@0.2.1": "0.2.1",
+    "npm:effection@4.1.0-alpha.5": "4.1.0-alpha.5"
   },
   "jsr": {
     "@effection/effection@4.1.0-alpha.5": {
@@ -145,6 +146,9 @@
     },
     "detect-libc@2.1.2": {
       "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ=="
+    },
+    "effection@4.1.0-alpha.5": {
+      "integrity": "sha512-UCYrU5wGaRYxhcUHx7eVeJ+Cwm/r7zsL484lswbGDVxKeOjqTARNcOxH0CWc4y9Xr5S1KjW0tsdOdgOdXE8wag=="
     },
     "fastq@1.20.1": {
       "integrity": "sha512-GGToxJ/w1x32s/D2EKND7kTil4n8OVk/9mycTc4VDza13lOvpUZTGX3mFSCtV9ksdGBVzvsyAVLM6mHFThxXxw==",

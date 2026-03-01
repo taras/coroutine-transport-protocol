@@ -42,6 +42,14 @@ export {
   EarlyReturnDivergenceError,
 } from "./errors.ts";
 
+// Divergence API — pluggable policy for replay mismatches (DEC-031)
+export { Divergence } from "./divergence.ts";
+export type {
+  DivergenceDecision,
+  DivergenceInfo,
+  DivergenceKind,
+} from "./divergence.ts";
+
 // Context
 export { DurableCtx } from "./context.ts";
 export type { DurableContext } from "./context.ts";

@@ -631,3 +631,51 @@ Updated before completion of every phase and committed at the end of each phase.
   cursor-based checkpointing will bound journal growth. Nested
   `durableEach` calls require separate child scopes (inner clobbers
   outer context).
+
+## DEC-031: Divergence API — pluggable policy via Effection's Api pattern
+
+- **Date:** 2026-03-01
+- **Context:** Divergence detection (description mismatch, continue-past-close)
+  was hard-coded in `createDurableEffect()` — every mismatch unconditionally
+  threw `DivergenceError` or `ContinuePastCloseDivergenceError`. Users had no
+  way to override this behavior (e.g., to switch a coroutine to live execution
+  when the workflow code has intentionally changed).
+- **Decision:** Delegate divergence policy to a `Divergence` API object using
+  Effection's `Api<A>` pattern with `scope.around()` middleware support.
+  - The API has one method: `decide(info: DivergenceInfo): DivergenceDecision`
+  - `DivergenceInfo` is a discriminated union on `kind`: `"description-mismatch"` |
+    `"continue-past-close"`, carrying context about the divergence
+  - `DivergenceDecision` has two variants: `{ type: "throw"; error: Error }` |
+    `{ type: "run-live" }`
+  - Default behavior is strict: all divergences return `{ type: "throw" }`
+  - Users override via `scope.around(Divergence, { decide: ([info], next) => ... })`
+  - `durableRun` accepts `setup?: (scope: Scope) => void` to install middleware
+    before the workflow runs
+  - `decide()` is synchronous because it's called from `Effect.enter()`, which
+    cannot yield. The middleware chain runs synchronously via `Divergence.invoke(scope, "decide", [info])`
+  - When `run-live` is decided, `replayIndex.disableReplay(coroutineId)` is called
+    and execution falls through to the live path via a labeled `replay:` block
+  - The early-return divergence check in `durableRun` is skipped when replay is
+    disabled for the root coroutine (the Divergence API already approved the change)
+- **Implementation notes:**
+  - Cannot use `createApi()` from `@effection/effection/experimental` due to a
+    circular initialization bug in Effection 4.1.0-alpha.5 (`scope-internal.ts` ↔
+    `api.ts`). Instead, the `Divergence` object is built manually using
+    `createContext()` from the main module and a hand-rolled middleware dispatch
+    that mirrors `createApiInternal`'s logic. The object is structurally compatible
+    with `ApiInternal<A>` (has a `context` field) so `scope.around()` works.
+  - `ReplayIndex` gained `disableReplay(id)`, `isReplayDisabled(id)`, and guards
+    in `peekYield()`, `hasClose()`, `isFullyReplayed()` to skip replay for disabled
+    coroutines
+  - `CoroutineView.scope` in `types.ts` was widened from a minimal type to
+    Effection's full `Scope` type, since `Divergence.invoke()` needs `reduce()`
+    for middleware collection
+- **Rationale:** Following the same pattern Effection uses for its own built-in
+  APIs (Scope, Main) ensures composability. Middleware is scope-scoped, so
+  different workflow runs can have different divergence policies. The `setup`
+  callback on `durableRun` provides a clean injection point without requiring
+  callers to manage scopes directly.
+- **Consequences:** Divergence handling is now a pluggable policy rather than a
+  hard-coded behavior. The `run-live` decision path enables future code evolution
+  scenarios (e.g., "patching" in Temporal's terminology). The circular dependency
+  workaround should be removed when Effection fixes the `experimental` entry point.

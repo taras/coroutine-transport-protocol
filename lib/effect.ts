@@ -6,14 +6,15 @@
  * either feeds the stored result (replay) or executes live with
  * persist-before-resume semantics.
  *
+ * Divergence policy is delegated to the Divergence API (DEC-031).
+ * By default, mismatches are fatal. Users can install middleware via
+ * scope.around(Divergence, ...) to override behavior per-scope.
+ *
  * See integration doc §5.1, protocol spec §4.2, §5, §6.
  */
 
 import { DurableCtx, type DurableContext } from "./context.ts";
-import {
-  ContinuePastCloseDivergenceError,
-  DivergenceError,
-} from "./errors.ts";
+import { Divergence } from "./divergence.ts";
 import { protocolToEffection, serializeError } from "./serialize.ts";
 import type {
   DurableEffect,
@@ -61,51 +62,81 @@ export function createDurableEffect<T>(
       const ctx = routine.scope.expect<DurableContext>(DurableCtx);
       const entry = ctx.replayIndex.peekYield(ctx.coroutineId);
 
-      if (entry) {
-        // ── REPLAY PATH ──
-        // §6.2: Validate description match
-        if (
-          entry.description.type !== desc.type ||
-          entry.description.name !== desc.name
-        ) {
-          const cursor = ctx.replayIndex.getCursor(ctx.coroutineId);
-          resolve({
-            ok: false,
-            error: new DivergenceError(
-              ctx.coroutineId,
-              cursor,
-              entry.description,
-              desc,
-            ),
-          });
+      // ── REPLAY PATH ──
+      // Use a labeled block so that divergence decisions of type "run-live"
+      // can break out to fall through to the live execution path.
+      replay: {
+        if (entry) {
+          // §6.2: Validate description match
+          if (
+            entry.description.type !== desc.type ||
+            entry.description.name !== desc.name
+          ) {
+            // Delegate divergence policy to the Divergence API.
+            // Api.invoke() runs the middleware chain synchronously.
+            const cursor = ctx.replayIndex.getCursor(ctx.coroutineId);
+            const decision = Divergence.invoke(
+              routine.scope,
+              "decide",
+              [{
+                kind: "description-mismatch",
+                coroutineId: ctx.coroutineId,
+                cursor,
+                expected: entry.description,
+                actual: desc,
+              }],
+            );
+
+            if (decision.type === "throw") {
+              resolve({ ok: false, error: decision.error });
+              return (exit) => exit(VOID_OK);
+            }
+
+            // decision.type === "run-live"
+            // Disable replay for this coroutine and fall through to live path.
+            ctx.replayIndex.disableReplay(ctx.coroutineId);
+            break replay;
+          }
+
+          // Description matches — consume the entry and advance cursor
+          ctx.replayIndex.consumeYield(ctx.coroutineId);
+
+          // Feed stored result synchronously — no I/O, no side effects.
+          // Convert from protocol Result to Effection Result.
+          resolve(protocolToEffection<T>(entry.result));
           return (exit) => exit(VOID_OK);
         }
 
-        // Consume the entry and advance cursor
-        ctx.replayIndex.consumeYield(ctx.coroutineId);
+        // No replay entry. Check for continue-past-close divergence (§6.3).
+        // If the journal has a Close for this coroutine but no more yields,
+        // the generator has diverged by continuing to yield effects.
+        if (ctx.replayIndex.hasClose(ctx.coroutineId)) {
+          const yieldCount = ctx.replayIndex.yieldCount(ctx.coroutineId);
+          const decision = Divergence.invoke(
+            routine.scope,
+            "decide",
+            [{
+              kind: "continue-past-close",
+              coroutineId: ctx.coroutineId,
+              yieldCount,
+            }],
+          );
 
-        // Feed stored result synchronously — no I/O, no side effects.
-        // Convert from protocol Result to Effection Result.
-        resolve(protocolToEffection<T>(entry.result));
-        return (exit) => exit(VOID_OK);
-      }
+          if (decision.type === "throw") {
+            resolve({ ok: false, error: decision.error });
+            return (exit) => exit(VOID_OK);
+          }
 
-      // No replay entry. Check for continue-past-close divergence (§6.3).
-      // If the journal has a Close for this coroutine but no more yields,
-      // the generator has diverged by continuing to yield effects.
-      if (ctx.replayIndex.hasClose(ctx.coroutineId)) {
-        const yieldCount = ctx.replayIndex.yieldCount(ctx.coroutineId);
-        resolve({
-          ok: false,
-          error: new ContinuePastCloseDivergenceError(
-            ctx.coroutineId,
-            yieldCount,
-          ),
-        });
-        return (exit) => exit(VOID_OK);
-      }
+          // decision.type === "run-live"
+          ctx.replayIndex.disableReplay(ctx.coroutineId);
+          break replay;
+        }
+      } // end replay block
 
       // ── LIVE PATH ──
+      // Reached either because:
+      // 1. No replay entry and no Close (normal live execution)
+      // 2. Divergence API returned "run-live" (replay disabled)
 
       /** Persist a Yield event then resume the generator. */
       function persistAndResolve(result: Result): void {
