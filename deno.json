@@ -5,7 +5,11 @@
   "tasks": {
     "test": "deno test --allow-net --allow-read --allow-env --allow-ffi",
     "check": "deno check lib/mod.ts",
-    "typecheck": "deno check lib/**/*.ts test/**/*.ts"
+    "typecheck": "deno check lib/**/*.ts test/**/*.ts",
+    "demo": "./demo/start.sh",
+    "demo:server": "deno run --allow-net --allow-read --allow-env --allow-ffi demo/server.ts",
+    "demo:cook": "deno run --allow-net --allow-read --allow-env demo/cook.ts",
+    "demo:tail": "deno run --allow-net --allow-read --allow-env demo/tail.ts"
   },
   "imports": {
     "@std/assert": "jsr:@std/assert@^1.0.19",
