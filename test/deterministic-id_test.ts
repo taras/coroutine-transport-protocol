@@ -7,6 +7,7 @@
  */
 
 import { assertEquals } from "@std/assert";
+import { run } from "@effection/effection";
 import {
   durableAll,
   durableCall,
@@ -71,13 +72,13 @@ Deno.test("deterministic IDs: same workflow produces same coroutine IDs across t
   // Run 1
   const stream1 = new InMemoryStream();
   const tracker1 = createCallTracker();
-  await durableRun(makeWorkflow(tracker1), { stream: stream1 });
+  await run(() => durableRun(makeWorkflow(tracker1), { stream: stream1 }));
   const events1 = await stream1.readAll();
 
   // Run 2
   const stream2 = new InMemoryStream();
   const tracker2 = createCallTracker();
-  await durableRun(makeWorkflow(tracker2), { stream: stream2 });
+  await run(() => durableRun(makeWorkflow(tracker2), { stream: stream2 }));
   const events2 = await stream2.readAll();
 
   // Coroutine IDs must be identical
@@ -96,7 +97,7 @@ Deno.test("deterministic IDs: live run and replay produce identical coroutine ID
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  await durableRun(
+  await run(() => durableRun(
     function* () {
       const a = yield* durableCall("step1", tracker.fn("step1", "one"));
       const results = yield* durableAll([
@@ -110,7 +111,7 @@ Deno.test("deterministic IDs: live run and replay produce identical coroutine ID
       return `${a}-${results.join(",")}`;
     },
     { stream },
-  );
+  ));
 
   const liveEvents = await stream.readAll();
   const liveIds = coroutineIds(liveEvents);
@@ -119,7 +120,7 @@ Deno.test("deterministic IDs: live run and replay produce identical coroutine ID
   const replayStream = new InMemoryStream(liveEvents);
   const tracker2 = createCallTracker();
 
-  await durableRun(
+  await run(() => durableRun(
     function* () {
       const a = yield* durableCall("step1", tracker2.fn("step1", "WRONG"));
       const results = yield* durableAll([
@@ -133,7 +134,7 @@ Deno.test("deterministic IDs: live run and replay produce identical coroutine ID
       return `${a}-${results.join(",")}`;
     },
     { stream: replayStream },
-  );
+  ));
 
   // No effects re-executed during replay
   assertEquals(tracker2.calls, []);
@@ -155,7 +156,7 @@ Deno.test("deterministic IDs: nested all produces hierarchical IDs", async () =>
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  await durableRun(
+  await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -177,7 +178,7 @@ Deno.test("deterministic IDs: nested all produces hierarchical IDs", async () =>
       return results.join("-");
     },
     { stream },
-  );
+  ));
 
   const events = await stream.readAll();
   const ids = coroutineIds(events);
@@ -197,7 +198,7 @@ Deno.test("deterministic IDs: changing child count produces divergence on replay
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  await durableRun(
+  await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -212,7 +213,7 @@ Deno.test("deterministic IDs: changing child count produces divergence on replay
       return `${results.join(",")}-${after}`;
     },
     { stream },
-  );
+  ));
 
   // Full replay returns stored result (root has Close), so divergence
   // from changing child count isn't detected on full replay.
@@ -239,7 +240,7 @@ Deno.test("deterministic IDs: changing child count produces divergence on replay
   // With 3 children, root's childCounter goes to 3, but journal has
   // root.0 and root.1 Close events. root.2 is new (no journal).
   // This should work without divergence — the third child just executes live.
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -256,7 +257,7 @@ Deno.test("deterministic IDs: changing child count produces divergence on replay
       return `${results.join(",")}-${after}`;
     },
     { stream: partialStream },
-  );
+  ));
 
   // Children 0 and 1 replayed, child 2 executed live, "after" executed live
   assertEquals(result, "a,b,c-z");
@@ -270,7 +271,7 @@ Deno.test("deterministic IDs: changing child count produces divergence on replay
 Deno.test("deterministic IDs: race children get sequential IDs", async () => {
   const stream = new InMemoryStream();
 
-  await durableRun(
+  await run(() => durableRun(
     function* () {
       return yield* durableRace([
         function* () {
@@ -288,7 +289,7 @@ Deno.test("deterministic IDs: race children get sequential IDs", async () => {
       ]);
     },
     { stream },
-  );
+  ));
 
   const events = await stream.readAll();
 

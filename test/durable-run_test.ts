@@ -7,6 +7,7 @@
  */
 
 import { assertEquals, assertRejects } from "@std/assert";
+import { run } from "@effection/effection";
 import {
   durableCall,
   durableRun,
@@ -48,7 +49,7 @@ Deno.test("golden run: executes all effects live and records events", async () =
     return `${a}-${b}`;
   }
 
-  const result = await durableRun(workflow, { stream });
+  const result = await run(() => durableRun(workflow, { stream }));
 
   // Verify result
   assertEquals(result, "alpha-beta");
@@ -114,7 +115,7 @@ Deno.test("full replay: returns stored result without re-executing effects", asy
     return `${a}-${b}`;
   }
 
-  const result = await durableRun(workflow, { stream });
+  const result = await run(() => durableRun(workflow, { stream }));
 
   // Result comes from the stored Close event
   assertEquals(result, "alpha-beta");
@@ -139,7 +140,7 @@ Deno.test("crash before first effect: empty stream, all live", async () => {
     return a;
   }
 
-  const result = await durableRun(workflow, { stream });
+  const result = await run(() => durableRun(workflow, { stream }));
 
   assertEquals(result, "alpha");
   assertEquals(tracker.calls, ["stepA"]);
@@ -171,7 +172,7 @@ Deno.test("crash at position N: first N replayed, rest live", async () => {
     return `${a}-${b}`;
   }
 
-  const result = await durableRun(workflow, { stream });
+  const result = await run(() => durableRun(workflow, { stream }));
 
   // stepA was replayed (returns stored "alpha", not "WRONG")
   // stepB was executed live
@@ -220,7 +221,7 @@ Deno.test("crash after last effect: all Yields replayed, Close appended", async 
     return `${a}-${b}`;
   }
 
-  const result = await durableRun(workflow, { stream });
+  const result = await run(() => durableRun(workflow, { stream }));
 
   // Both effects replayed from journal
   assertEquals(result, "alpha-beta");
@@ -264,7 +265,7 @@ Deno.test("persist-before-resume: generator does not advance until write complet
     return "done";
   }
 
-  await durableRun(workflow, { stream });
+  await run(() => durableRun(workflow, { stream }));
 
   // Verify ordering: execute → persist → resume for each step
   assertEquals(order, [
@@ -293,7 +294,7 @@ Deno.test("actor handoff: Process B resumes from Process A's events", async () =
     return `${a}-${b}-${c}`;
   }
 
-  await durableRun(workflow, { stream: streamA });
+  await run(() => durableRun(workflow, { stream: streamA }));
 
   // Process A executed all steps
   assertEquals(trackerA.calls, ["stepA", "stepB", "stepC"]);
@@ -313,7 +314,7 @@ Deno.test("actor handoff: Process B resumes from Process A's events", async () =
     return `${a}-${b}-${c}`;
   }
 
-  const result = await durableRun(workflowB, { stream: streamB });
+  const result = await run(() => durableRun(workflowB, { stream: streamB }));
 
   // stepA and stepB replayed, stepC executed live
   assertEquals(result, "alpha-beta-gamma");
@@ -339,7 +340,7 @@ Deno.test("golden run with error: records Close(err) event", async () => {
   }
 
   await assertRejects(
-    () => durableRun(workflow, { stream }),
+    () => run(() => durableRun(workflow, { stream })),
     Error,
     "boom",
   );

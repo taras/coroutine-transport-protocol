@@ -1,15 +1,20 @@
 /**
  * durableRun — entry point for durable workflow execution.
  *
- * Creates an Effection scope, reads the event stream, builds the ReplayIndex,
- * sets DurableContext on the scope, runs the workflow, and emits a Close event
- * when the workflow terminates.
+ * An Operation<T> that reads the event stream, builds the ReplayIndex,
+ * sets DurableContext on the current scope, runs the workflow, and emits
+ * a Close event when the workflow terminates.
+ *
+ * Because durableRun is an Operation, it inherits the caller's Effection
+ * scope — including any middleware installed via scope.around(). This is
+ * how divergence policy overrides work: the caller installs middleware
+ * before yield*-ing into durableRun. See DEC-032.
  *
  * See integration doc §10, protocol spec §4.
  */
 
-import { createScope } from "@effection/effection";
-import type { Operation, Scope } from "@effection/effection";
+import { call, useScope } from "@effection/effection";
+import type { Operation } from "@effection/effection";
 import { DurableCtx } from "./context.ts";
 import { EarlyReturnDivergenceError } from "./errors.ts";
 import { ReplayIndex } from "./replay-index.ts";
@@ -25,37 +30,35 @@ export interface DurableRunOptions {
   stream: DurableStream;
   /** Coroutine ID for the root workflow. Defaults to "root". */
   coroutineId?: string;
-  /**
-   * Optional setup callback invoked with the Effection scope before the
-   * workflow runs. Use this to install middleware (e.g., divergence
-   * policy overrides via `scope.around(Divergence, ...)`).
-   *
-   * The callback receives the raw Scope, not a generator context, so
-   * only synchronous scope methods (set, around) are available.
-   */
-  setup?: (scope: Scope) => void;
 }
 
 /**
  * Execute a durable workflow.
  *
  * 1. Reads all events from the stream and builds a ReplayIndex.
- * 2. Creates an Effection scope with DurableContext.
+ * 2. Sets DurableContext on the current scope (inherited from caller).
  * 3. Runs the workflow — replayed effects resolve synchronously from
  *    the index; live effects execute and persist before resuming.
  * 4. On completion, appends a Close event to the stream.
  * 5. On error, appends a Close(err) event.
  *
  * Returns the workflow's result value.
+ *
+ * Usage:
+ *   // From async code (standalone):
+ *   await run(() => durableRun(workflow, { stream }));
+ *
+ *   // From inside an Effection generator (inherits scope):
+ *   const result = yield* durableRun(workflow, { stream });
  */
-export async function durableRun<T extends Json | void>(
+export function* durableRun<T extends Json | void>(
   workflow: () => Workflow<T> | Operation<T>,
   options: DurableRunOptions,
-): Promise<T> {
-  const { stream, coroutineId = "root", setup } = options;
+): Operation<T> {
+  const { stream, coroutineId = "root" } = options;
 
   // Read all events and build replay index
-  const events = await stream.readAll();
+  const events = yield* call(() => stream.readAll());
   const replayIndex = new ReplayIndex(events);
 
   // If the root coroutine already has a Close event in the journal,
@@ -72,8 +75,9 @@ export async function durableRun<T extends Json | void>(
     }
   }
 
-  // Create an Effection scope and set DurableContext
-  const [scope, destroy] = createScope();
+  // Inherit the caller's scope — middleware (e.g., Divergence) is
+  // already installed by the caller before yield*-ing into durableRun.
+  const scope = yield* useScope();
 
   scope.set(DurableCtx, {
     replayIndex,
@@ -82,18 +86,12 @@ export async function durableRun<T extends Json | void>(
     childCounter: 0,
   });
 
-  // Allow callers to install middleware or configure the scope before
-  // the workflow executes. This is the extension point for divergence
-  // policy overrides (DEC-031).
-  if (setup) {
-    setup(scope);
-  }
+  let closeEvent: Close | undefined;
 
   try {
     // Workflow<T> is structurally assignable to Operation<T>, so
-    // scope.run() accepts it directly — no cast needed.
-    const task = scope.run(workflow);
-    const result = await task;
+    // yield* accepts it directly — no cast needed.
+    const result: T = yield* workflow();
 
     // §6.3: Check for early return divergence.
     // If the generator returned but the replay index has unconsumed yields,
@@ -108,20 +106,17 @@ export async function durableRun<T extends Json | void>(
       }
     }
 
-    // Append Close(ok) event
-    const closeEvent: Close = {
+    // Record Close(ok) — will be appended in finally
+    closeEvent = {
       type: "close",
       coroutineId,
       result: { status: "ok", value: result as Json },
     };
-    await stream.append(closeEvent);
 
     return result;
   } catch (error) {
-    // Append Close(err) event — best-effort. If the append itself fails
-    // (e.g., stream is in a fatal state), we still throw the original
-    // workflow error so it isn't masked by the append failure.
-    const closeEvent: Close = {
+    // Record Close(err) — will be appended in finally
+    closeEvent = {
       type: "close",
       coroutineId,
       result: {
@@ -131,21 +126,18 @@ export async function durableRun<T extends Json | void>(
         ),
       },
     };
-    try {
-      await stream.append(closeEvent);
-    } catch {
-      // Close event append failed — the original error is more important.
-    }
 
     throw error;
   } finally {
-    // Swallow destroy errors. If the scope is in an error state (e.g.,
-    // a child threw), destroy() may throw "halted". We don't want that
-    // to mask the original error from the catch block.
-    try {
-      await destroy();
-    } catch {
-      // Scope cleanup errors are expected when the workflow failed.
+    // Append Close event — best-effort. If the append itself fails
+    // (e.g., stream is in a fatal state), we swallow the error so it
+    // doesn't mask the original workflow error.
+    if (closeEvent) {
+      try {
+        yield* call(() => stream.append(closeEvent!));
+      } catch {
+        // Close event append failed — the original error is more important.
+      }
     }
   }
 }

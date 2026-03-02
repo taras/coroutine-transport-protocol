@@ -7,6 +7,7 @@
  */
 
 import { assertEquals, assertRejects } from "@std/assert";
+import { run } from "@effection/effection";
 import {
   durableAll,
   durableCall,
@@ -43,7 +44,7 @@ Deno.test("all: golden run — all children execute live", async () => {
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -56,7 +57,7 @@ Deno.test("all: golden run — all children execute live", async () => {
       return `${results[0]}-${results[1]}`;
     },
     { stream },
-  );
+  ));
 
   assertEquals(result, "alpha-beta");
   assertEquals(tracker.calls.sort(), ["fetchA", "fetchB"]);
@@ -88,7 +89,7 @@ Deno.test("all: full replay — returns stored result without re-executing", asy
   const stream = new InMemoryStream();
   const tracker1 = createCallTracker();
 
-  await durableRun(
+  await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -101,13 +102,13 @@ Deno.test("all: full replay — returns stored result without re-executing", asy
       return `${results[0]}-${results[1]}`;
     },
     { stream },
-  );
+  ));
 
   // Second: replay with the same stream
   const tracker2 = createCallTracker();
   const replayStream = new InMemoryStream(await stream.readAll());
 
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -120,7 +121,7 @@ Deno.test("all: full replay — returns stored result without re-executing", asy
       return `${results[0]}-${results[1]}`;
     },
     { stream: replayStream },
-  );
+  ));
 
   // Result from stored Close event
   assertEquals(result, "alpha-beta");
@@ -138,7 +139,7 @@ Deno.test("all: partial replay — completed children replayed, incomplete re-ex
   const goldenStream = new InMemoryStream();
   const goldenTracker = createCallTracker();
 
-  await durableRun(
+  await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -163,7 +164,7 @@ Deno.test("all: partial replay — completed children replayed, incomplete re-ex
       return results.join("-");
     },
     { stream: goldenStream },
-  );
+  ));
 
   // Simulate crash: keep events for root.0 and root.1 only
   // (child 2's events and root Close are dropped)
@@ -177,7 +178,7 @@ Deno.test("all: partial replay — completed children replayed, incomplete re-ex
   const partialStream = new InMemoryStream(partialEvents);
   const tracker = createCallTracker();
 
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -193,7 +194,7 @@ Deno.test("all: partial replay — completed children replayed, incomplete re-ex
       return results.join("-");
     },
     { stream: partialStream },
-  );
+  ));
 
   // Children 0,1 replayed from stored Close. Child 2 executed live.
   assertEquals(result, "alpha-beta-gamma");
@@ -210,7 +211,7 @@ Deno.test("all: nested — inner all inside outer all", async () => {
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -232,7 +233,7 @@ Deno.test("all: nested — inner all inside outer all", async () => {
       return results.join("-");
     },
     { stream },
-  );
+  ));
 
   assertEquals(result, "a+b-B");
   assertEquals(tracker.calls.sort(), ["innerA", "innerB", "outerB"]);
@@ -257,7 +258,7 @@ Deno.test("race: golden run — first to complete wins", async () => {
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       return yield* durableRace([
         function* () {
@@ -276,7 +277,7 @@ Deno.test("race: golden run — first to complete wins", async () => {
       ]);
     },
     { stream },
-  );
+  ));
 
   assertEquals(result, "winner");
 
@@ -299,7 +300,7 @@ Deno.test("race: full replay — returns stored result without re-executing", as
   const stream = new InMemoryStream();
   const tracker1 = createCallTracker();
 
-  const result1 = await durableRun(
+  const result1 = await run(() => durableRun(
     function* () {
       return yield* durableRace([
         function* () {
@@ -318,13 +319,13 @@ Deno.test("race: full replay — returns stored result without re-executing", as
       ]);
     },
     { stream },
-  );
+  ));
 
   // Replay
   const tracker2 = createCallTracker();
   const replayStream = new InMemoryStream(await stream.readAll());
 
-  const result2 = await durableRun(
+  const result2 = await run(() => durableRun(
     function* () {
       return yield* durableRace([
         function* () {
@@ -343,7 +344,7 @@ Deno.test("race: full replay — returns stored result without re-executing", as
       ]);
     },
     { stream: replayStream },
-  );
+  ));
 
   assertEquals(result2, result1);
   assertEquals(tracker2.calls, []);
@@ -358,7 +359,7 @@ Deno.test("all: child error — siblings cancelled, error propagated", async () 
 
   await assertRejects(
     () =>
-      durableRun(
+      run(() => durableRun(
         function* () {
           const results = yield* durableAll([
             function* () {
@@ -376,7 +377,7 @@ Deno.test("all: child error — siblings cancelled, error propagated", async () 
           return results.join("-");
         },
         { stream },
-      ),
+      )),
     Error,
     "child-boom",
   );
@@ -397,7 +398,7 @@ Deno.test("all: error boundary — parent catches child error", async () => {
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       try {
         yield* durableAll([
@@ -421,7 +422,7 @@ Deno.test("all: error boundary — parent catches child error", async () => {
       return recovery;
     },
     { stream },
-  );
+  ));
 
   assertEquals(result, "recovered");
   assertEquals(tracker.calls.includes("recovery"), true);
@@ -434,7 +435,7 @@ Deno.test("all: error boundary — parent catches child error", async () => {
 Deno.test("race: winner Close(ok), loser gets Close(cancelled)", async () => {
   const stream = new InMemoryStream();
 
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       return yield* durableRace([
         function* () {
@@ -452,7 +453,7 @@ Deno.test("race: winner Close(ok), loser gets Close(cancelled)", async () => {
       ]);
     },
     { stream },
-  );
+  ));
 
   assertEquals(result, "won");
 
@@ -493,7 +494,7 @@ Deno.test("race: full replay — returns stored result without re-executing", as
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  const result1 = await durableRun(
+  const result1 = await run(() => durableRun(
     function* () {
       return yield* durableRace([
         function* () {
@@ -507,13 +508,13 @@ Deno.test("race: full replay — returns stored result without re-executing", as
       ]);
     },
     { stream },
-  );
+  ));
 
   // Replay with complete journal (root Close present)
   const replayStream = new InMemoryStream(await stream.readAll());
   const tracker2 = createCallTracker();
 
-  const result2 = await durableRun(
+  const result2 = await run(() => durableRun(
     function* () {
       return yield* durableRace([
         function* () {
@@ -527,7 +528,7 @@ Deno.test("race: full replay — returns stored result without re-executing", as
       ]);
     },
     { stream: replayStream },
-  );
+  ));
 
   assertEquals(result2, result1);
   assertEquals(tracker2.calls, []);
@@ -541,7 +542,7 @@ Deno.test("race: partial replay — cancelled loser replays via suspend", async 
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  await durableRun(
+  await run(() => durableRun(
     function* () {
       return yield* durableRace([
         function* () {
@@ -554,7 +555,7 @@ Deno.test("race: partial replay — cancelled loser replays via suspend", async 
       ]);
     },
     { stream },
-  );
+  ));
 
   // Simulate crash: strip root Close but keep everything else
   // (winner Close(ok), loser Close(cancelled), winner yield, loser yield)
@@ -566,7 +567,7 @@ Deno.test("race: partial replay — cancelled loser replays via suspend", async 
 
   // Replay: winner replays from Close(ok), loser sees Close(cancelled)
   // and suspends (blocks until parent race cancels it naturally).
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       return yield* durableRace([
         function* () {
@@ -579,7 +580,7 @@ Deno.test("race: partial replay — cancelled loser replays via suspend", async 
       ]);
     },
     { stream: partialStream },
-  );
+  ));
 
   // Winner's result replayed from journal
   assertEquals(result, "winner");
@@ -595,7 +596,7 @@ Deno.test("mixed: durableCall then durableAll", async () => {
   const stream = new InMemoryStream();
   const tracker = createCallTracker();
 
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       const prefix = yield* durableCall("prefix", tracker.fn("prefix", "PRE"));
       const results = yield* durableAll([
@@ -609,7 +610,7 @@ Deno.test("mixed: durableCall then durableAll", async () => {
       return `${prefix}-${results.join(",")}`;
     },
     { stream },
-  );
+  ));
 
   assertEquals(result, "PRE-a,b");
 
@@ -617,7 +618,7 @@ Deno.test("mixed: durableCall then durableAll", async () => {
   const replayStream = new InMemoryStream(await stream.readAll());
   const tracker2 = createCallTracker();
 
-  const result2 = await durableRun(
+  const result2 = await run(() => durableRun(
     function* () {
       const prefix = yield* durableCall(
         "prefix",
@@ -634,7 +635,7 @@ Deno.test("mixed: durableCall then durableAll", async () => {
       return `${prefix}-${results.join(",")}`;
     },
     { stream: replayStream },
-  );
+  ));
 
   assertEquals(result2, "PRE-a,b");
   assertEquals(tracker2.calls, []);

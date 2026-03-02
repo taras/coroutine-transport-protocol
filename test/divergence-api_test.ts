@@ -3,9 +3,16 @@
  *
  * Tests that the Divergence API correctly delegates divergence decisions
  * and that middleware can override default strict behavior. See DEC-031.
+ *
+ * Since durableRun is now an Operation<T> (DEC-032), middleware is
+ * installed by the caller's scope before yield*-ing into durableRun.
+ * Tests use a wrapper Operation that calls useScope(), installs
+ * middleware via scope.around(), then yield*s into durableRun.
  */
 
 import { assertEquals, assertIsError, assertRejects } from "@std/assert";
+import { run, useScope } from "@effection/effection";
+import type { Operation } from "@effection/effection";
 import {
   Divergence,
   DivergenceError,
@@ -36,14 +43,16 @@ Deno.test("divergence api: default strict — description mismatch throws Diverg
 
   const error = await assertRejects(
     () =>
-      durableRun(
-        function* (): Workflow<string> {
-          return yield* durableCall<string>(
-            "stepX",
-            () => Promise.resolve("x"),
-          );
-        },
-        { stream },
+      run(() =>
+        durableRun(
+          function* (): Workflow<string> {
+            return yield* durableCall<string>(
+              "stepX",
+              () => Promise.resolve("x"),
+            );
+          },
+          { stream },
+        ),
       ),
     Error,
   );
@@ -101,36 +110,38 @@ Deno.test("divergence api: middleware override — mismatch triggers run-live an
 
   const liveCalls: string[] = [];
 
-  const result = await durableRun(
-    function* (): Workflow<string> {
-      // stepA matches journal — replayed
-      const a = yield* durableCall<string>("stepA", () => {
-        liveCalls.push("stepA");
-        return Promise.resolve("alpha-live");
-      });
-
-      // stepB was renamed to stepX — divergence detected, middleware returns run-live
-      const x = yield* durableCall<string>("stepX", () => {
-        liveCalls.push("stepX");
-        return Promise.resolve("x-live");
-      });
-
-      return `${a}-${x}`;
-    },
-    {
-      stream,
-      setup(scope) {
-        scope.around(Divergence, {
-          decide([info], next) {
-            if (info.kind === "description-mismatch") {
-              return { type: "run-live" } as DivergenceDecision;
-            }
-            return next(info);
-          },
-        });
+  const result = await run(function* (): Operation<string> {
+    // Install divergence middleware on the caller's scope
+    const scope = yield* useScope();
+    scope.around(Divergence, {
+      decide([info], next) {
+        if (info.kind === "description-mismatch") {
+          return { type: "run-live" } as DivergenceDecision;
+        }
+        return next(info);
       },
-    },
-  );
+    });
+
+    // Now yield* into durableRun — it inherits the scope with middleware
+    return yield* durableRun(
+      function* (): Workflow<string> {
+        // stepA matches journal — replayed
+        const a = yield* durableCall<string>("stepA", () => {
+          liveCalls.push("stepA");
+          return Promise.resolve("alpha-live");
+        });
+
+        // stepB was renamed to stepX — divergence detected, middleware returns run-live
+        const x = yield* durableCall<string>("stepX", () => {
+          liveCalls.push("stepX");
+          return Promise.resolve("x-live");
+        });
+
+        return `${a}-${x}`;
+      },
+      { stream },
+    );
+  });
 
   // stepA was replayed (got stored value "alpha"), stepX ran live
   assertEquals(result, "alpha-x-live");
@@ -155,39 +166,41 @@ Deno.test("divergence api: middleware is per-scope — only the configured run t
 
   // Run 1: WITH middleware — should succeed with run-live
   const stream1 = new InMemoryStream(makeEvents());
-  const result1 = await durableRun(
-    function* (): Workflow<string> {
-      return yield* durableCall<string>("stepX", () =>
-        Promise.resolve("x-live"),
-      );
-    },
-    {
-      stream: stream1,
-      setup(scope) {
-        scope.around(Divergence, {
-          decide([info], next) {
-            if (info.kind === "description-mismatch") {
-              return { type: "run-live" } as DivergenceDecision;
-            }
-            return next(info);
-          },
-        });
+  const result1 = await run(function* (): Operation<string> {
+    const scope = yield* useScope();
+    scope.around(Divergence, {
+      decide([info], next) {
+        if (info.kind === "description-mismatch") {
+          return { type: "run-live" } as DivergenceDecision;
+        }
+        return next(info);
       },
-    },
-  );
+    });
+
+    return yield* durableRun(
+      function* (): Workflow<string> {
+        return yield* durableCall<string>("stepX", () =>
+          Promise.resolve("x-live"),
+        );
+      },
+      { stream: stream1 },
+    );
+  });
   assertEquals(result1, "x-live");
 
   // Run 2: WITHOUT middleware — should throw DivergenceError
   const stream2 = new InMemoryStream(makeEvents());
   const error = await assertRejects(
     () =>
-      durableRun(
-        function* (): Workflow<string> {
-          return yield* durableCall<string>("stepX", () =>
-            Promise.resolve("x-live"),
-          );
-        },
-        { stream: stream2 },
+      run(() =>
+        durableRun(
+          function* (): Workflow<string> {
+            return yield* durableCall<string>("stepX", () =>
+              Promise.resolve("x-live"),
+            );
+          },
+          { stream: stream2 },
+        ),
       ),
     Error,
   );
@@ -224,19 +237,21 @@ Deno.test("divergence api: no regression — replay still feeds stored results w
   const stream = new InMemoryStream(events);
   const liveCalls: string[] = [];
 
-  const result = await durableRun(
-    function* (): Workflow<string> {
-      const a = yield* durableCall<string>("stepA", () => {
-        liveCalls.push("stepA");
-        return Promise.resolve("should-not-be-called");
-      });
-      const b = yield* durableCall<string>("stepB", () => {
-        liveCalls.push("stepB");
-        return Promise.resolve("should-not-be-called");
-      });
-      return `${a}-${b}`;
-    },
-    { stream },
+  const result = await run(() =>
+    durableRun(
+      function* (): Workflow<string> {
+        const a = yield* durableCall<string>("stepA", () => {
+          liveCalls.push("stepA");
+          return Promise.resolve("should-not-be-called");
+        });
+        const b = yield* durableCall<string>("stepB", () => {
+          liveCalls.push("stepB");
+          return Promise.resolve("should-not-be-called");
+        });
+        return `${a}-${b}`;
+      },
+      { stream },
+    ),
   );
 
   // Full replay returns stored Close result, no live calls

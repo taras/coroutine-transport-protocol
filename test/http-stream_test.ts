@@ -6,6 +6,7 @@
  */
 
 import { assertEquals, assertRejects } from "@std/assert";
+import { run } from "@effection/effection";
 import { DurableStreamTestServer } from "@durable-streams/server";
 import { StaleEpochError } from "@durable-streams/client";
 import {
@@ -241,7 +242,7 @@ Deno.test("http: durableRun golden run — full workflow against HTTP", async ()
     return `${a}-${b}`;
   }
 
-  const result = await durableRun(workflow, { stream });
+  const result = await run(() => durableRun(workflow, { stream }));
 
   assertEquals(result, "alpha-beta");
   assertEquals(tracker.calls, ["stepA", "stepB"]);
@@ -277,7 +278,7 @@ Deno.test("http: durableRun replay — no re-execution from HTTP stream", async 
     return `${a}-${b}`;
   }
 
-  await durableRun(workflow, { stream: stream1 });
+  await run(() => durableRun(workflow, { stream: stream1 }));
   assertEquals(tracker1.calls, ["stepA", "stepB"]);
 
   // Second run — replay with a fresh stream instance reading the same data
@@ -296,7 +297,7 @@ Deno.test("http: durableRun replay — no re-execution from HTTP stream", async 
     return `${a}-${b}`;
   }
 
-  const result = await durableRun(workflow2, { stream: stream2 });
+  const result = await run(() => durableRun(workflow2, { stream: stream2 }));
 
   // Should return same result without re-executing
   assertEquals(result, "alpha-beta");
@@ -319,7 +320,7 @@ Deno.test("http: concurrent appends via durableAll — correct ordering", async 
     epoch: 1,
   });
 
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* () {
       const results = yield* durableAll([
         function* () {
@@ -335,7 +336,7 @@ Deno.test("http: concurrent appends via durableAll — correct ordering", async 
       return results.join("-");
     },
     { stream },
-  );
+  ));
 
   assertEquals(result, "alpha-beta-gamma");
 
@@ -546,13 +547,13 @@ Deno.test("http: durableRun preserves original error when close append fails", a
   // Workflow that throws after its effects complete
   const err = await assertRejects(
     () =>
-      durableRun(
+      run(() => durableRun(
         function* (): Workflow<string> {
           yield* durableCall("stepA", () => Promise.resolve("alpha"));
           throw new Error("Workflow kaboom");
         },
         { stream },
-      ),
+      )),
     Error,
     "Workflow kaboom",
   );

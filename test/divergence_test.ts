@@ -7,6 +7,7 @@
  */
 
 import { assertEquals, assertIsError, assertRejects } from "@std/assert";
+import { run } from "@effection/effection";
 import {
   ContinuePastCloseDivergenceError,
   DivergenceError,
@@ -49,7 +50,7 @@ Deno.test("divergence: added step — generator yields more effects than journal
   // This workflow has a Close event, so durableRun returns stored result
   // directly. The added step isn't detected because the workflow is never
   // re-run. This is correct: a completed workflow stays completed.
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* (): Workflow<string> {
       yield* durableCall<string>("stepA", () => Promise.resolve("alpha"));
       yield* durableCall<string>("stepNew", () => Promise.resolve("new"));
@@ -57,7 +58,7 @@ Deno.test("divergence: added step — generator yields more effects than journal
       return "done";
     },
     { stream },
-  );
+  ));
 
   assertEquals(result, "done");
 });
@@ -82,7 +83,7 @@ Deno.test("divergence: added step — detected during partial replay", async () 
 
   const error = await assertRejects(
     () =>
-      durableRun(
+      run(() => durableRun(
         function* (): Workflow<string> {
           yield* durableCall<string>("stepA", () => Promise.resolve("alpha"));
           // This step wasn't in the journal — journal[1] is stepB, not stepNew
@@ -91,7 +92,7 @@ Deno.test("divergence: added step — detected during partial replay", async () 
           return "done";
         },
         { stream },
-      ),
+      )),
     Error,
   );
 
@@ -129,7 +130,7 @@ Deno.test("divergence: removed step — generator finishes before journal exhaus
 
   const error = await assertRejects(
     () =>
-      durableRun(
+      run(() => durableRun(
         function* (): Workflow<string> {
           yield* durableCall<string>("stepA", () => Promise.resolve("alpha"));
           yield* durableCall<string>("stepB", () => Promise.resolve("beta"));
@@ -137,7 +138,7 @@ Deno.test("divergence: removed step — generator finishes before journal exhaus
           return "done";
         },
         { stream },
-      ),
+      )),
     Error,
   );
 
@@ -173,7 +174,7 @@ Deno.test("divergence: reordered steps — description mismatch at position", as
 
   const error = await assertRejects(
     () =>
-      durableRun(
+      run(() => durableRun(
         function* (): Workflow<string> {
           // Reordered: stepB first, but journal has stepA at position 0
           yield* durableCall<string>("stepB", () => Promise.resolve("beta"));
@@ -181,7 +182,7 @@ Deno.test("divergence: reordered steps — description mismatch at position", as
           return "done";
         },
         { stream },
-      ),
+      )),
     Error,
   );
 
@@ -212,13 +213,13 @@ Deno.test("divergence: type mismatch — call vs sleep", async () => {
 
   const error = await assertRejects(
     () =>
-      durableRun(
+      run(() => durableRun(
         function* (): Workflow<void> {
           // Journal has call("stepA"), but we yield sleep("sleep")
           yield* durableSleep(1000);
         },
         { stream },
-      ),
+      )),
     Error,
   );
 
@@ -248,12 +249,12 @@ Deno.test("divergence: name mismatch — same type, different name", async () =>
 
   const error = await assertRejects(
     () =>
-      durableRun(
+      run(() => durableRun(
         function* (): Workflow<string> {
           return yield* durableCall<string>("fetchUser", () => Promise.resolve("user-data"));
         },
         { stream },
-      ),
+      )),
     Error,
   );
 
@@ -295,14 +296,14 @@ Deno.test("divergence: generator finishes early — returns with unconsumed yiel
 
   const error = await assertRejects(
     () =>
-      durableRun(
+      run(() => durableRun(
         function* (): Workflow<string> {
           const a = yield* durableCall<string>("stepA", () => Promise.resolve("alpha"));
           // Steps B and C were removed
           return a;
         },
         { stream },
-      ),
+      )),
     Error,
   );
 
@@ -338,14 +339,14 @@ Deno.test("divergence: continues past close — journal has Close but generator 
   // The workflow already has a Close event, so durableRun returns stored
   // result directly. The new step isn't detected.
   // This is the correct behavior: a completed workflow stays completed.
-  const result = await durableRun(
+  const result = await run(() => durableRun(
     function* (): Workflow<string> {
       yield* durableCall<string>("stepA", () => Promise.resolve("alpha"));
       yield* durableCall<string>("stepB", () => Promise.resolve("beta"));
       return "done";
     },
     { stream },
-  );
+  ));
 
   assertEquals(result, "alpha");
 });
@@ -390,13 +391,13 @@ Deno.test("divergence: action type mismatch — action vs call", async () => {
 
   const error = await assertRejects(
     () =>
-      durableRun(
+      run(() => durableRun(
         function* (): Workflow<number> {
           // Journal has action("doSomething"), code has call("doSomething")
           return yield* durableCall<number>("doSomething", () => Promise.resolve(42));
         },
         { stream },
-      ),
+      )),
     Error,
   );
 
