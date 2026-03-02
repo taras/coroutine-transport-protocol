@@ -1,7 +1,8 @@
 {
   "version": "5",
   "specifiers": {
-    "jsr:@effection/effection@4.1.0-alpha.5": "4.1.0-alpha.5",
+    "jsr:@effection/effection@*": "4.0.2",
+    "jsr:@effection/effection@4.1.0-alpha.7": "4.1.0-alpha.7",
     "jsr:@std/assert@^1.0.19": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.12",
     "npm:@durable-streams/client@0.2.1": "0.2.1",
@@ -9,8 +10,11 @@
     "npm:effection@4.1.0-alpha.5": "4.1.0-alpha.5"
   },
   "jsr": {
-    "@effection/effection@4.1.0-alpha.5": {
-      "integrity": "79fbad05e29393603bfe3ff83af975078153ab3c5f9afcae0312f402e2cdfb65"
+    "@effection/effection@4.0.2": {
+      "integrity": "1a3c7ffb6fa30adfd95ad97c2ed0d17900eddbe3ea00d7e1359c9ae147b8f696"
+    },
+    "@effection/effection@4.1.0-alpha.7": {
+      "integrity": "28bc9b5c009ae218a9696bf253d27d29a8fe0459a04fa428338f7d4107ca4d3c"
     },
     "@std/assert@1.0.19": {
       "integrity": "eaada96ee120cb980bc47e040f82814d786fe8162ecc53c91d8df60b8755991e",
@@ -232,7 +236,7 @@
   },
   "workspace": {
     "dependencies": [
-      "jsr:@effection/effection@4.1.0-alpha.5",
+      "jsr:@effection/effection@4.1.0-alpha.7",
       "jsr:@std/assert@^1.0.19",
       "npm:@durable-streams/client@0.2.1",
       "npm:@durable-streams/server@0.2.1"

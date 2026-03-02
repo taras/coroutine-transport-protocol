@@ -99,9 +99,6 @@ export type Resolve<T> = (value: T) => void;
  * The full Coroutine type is internal to Effection (@ignore), but
  * enter() receives it. We need `scope` to read DurableContext and
  * to invoke the Divergence API via Api.invoke(scope, ...).
- *
- * Uses the full Scope type because the Divergence API's invoke()
- * requires scope.around() support for middleware dispatch (DEC-031).
  */
 export interface CoroutineView {
   scope: Scope;

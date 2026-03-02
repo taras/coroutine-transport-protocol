@@ -9,19 +9,19 @@
  * override this behavior per-scope via Effection's around() middleware
  * to implement custom policies (e.g., switching to live execution).
  *
- * NOTE: We cannot use `createApi()` from `@effection/effection/experimental`
- * because that entry point triggers a circular initialization error in
- * Effection 4.1.0-alpha.5 (scope-internal.ts → api.ts → scope-internal.ts).
- * Instead, we implement a minimal API-compatible object using `createContext`
- * from the main module, which has no such circular dependency.
+ * Uses createApi() from @effection/effection/experimental to get
+ * proper middleware dispatch with caching and invalidation. The
+ * circular initialization bug that prevented this in alpha.5 was
+ * fixed in alpha.6 (see DEC-031).
  *
  * The core decide() function is synchronous (not a generator) because
  * it is called from inside Effect.enter(), which is a synchronous
- * callback. See DEC-031.
+ * callback. createApi().invoke() dispatches synchronously, so this
+ * is safe. See DEC-031.
  */
 
-import { createContext } from "@effection/effection";
-import type { Api, Around, Middleware, Scope } from "@effection/effection";
+import { createApi } from "@effection/effection/experimental";
+import type { Api } from "@effection/effection";
 import {
   ContinuePastCloseDivergenceError,
   DivergenceError,
@@ -84,7 +84,7 @@ export type DivergenceDecision =
  * Usage from Effect.enter() (synchronous):
  *   Divergence.invoke(scope, "decide", [info])
  *
- * Middleware installation (from outside a generator):
+ * Middleware installation (from a generator):
  *   scope.around(Divergence, { decide: ([info], next) => { ... } })
  */
 interface DivergenceApi {
@@ -92,34 +92,8 @@ interface DivergenceApi {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal API implementation (avoids circular dependency in experimental)
+// Default policy (strict — all divergences are fatal)
 // ---------------------------------------------------------------------------
-
-/**
- * Middleware storage type for the Divergence API context.
- * Each scope can have max (outer) and min (inner) middleware stacks.
- */
-interface MiddlewareStore {
-  max: Partial<Around<DivergenceApi>>[];
-  min: Partial<Around<DivergenceApi>>[];
-}
-
-/**
- * ScopeInternal-compatible interface for accessing the reduce() method.
- * This is what Effection's scope exposes internally for middleware collection.
- */
-interface ScopeWithReduce extends Scope {
-  reduce<T, S>(
-    context: { name: string; defaultValue?: T },
-    fn: (sum: S, item: T) => S,
-    initial: S,
-  ): S;
-}
-
-/** Context for storing middleware on the scope chain. */
-const middlewareContext = createContext<MiddlewareStore>(
-  "api::DurableEffection.Divergence",
-);
 
 /** The default (strict) decide function. */
 function defaultDecide(info: DivergenceInfo): DivergenceDecision {
@@ -144,82 +118,22 @@ function defaultDecide(info: DivergenceInfo): DivergenceDecision {
   }
 }
 
-/**
- * Combine an array of middleware functions into a single middleware.
- */
-function combineMiddleware<TArgs extends unknown[], TReturn>(
-  middlewares: Middleware<TArgs, TReturn>[],
-): Middleware<TArgs, TReturn> {
-  if (middlewares.length === 0) {
-    return (args, next) => next(...args);
-  }
-  return middlewares.reduceRight(
-    (sum, middleware) => (args, next) =>
-      middleware(args, (...args) => sum(args, next)),
-  );
-}
+// ---------------------------------------------------------------------------
+// The Divergence API instance
+// ---------------------------------------------------------------------------
 
 /**
- * The Divergence API instance.
+ * The Divergence API.
  *
- * Structurally compatible with Effection's Api<DivergenceApi> and
- * ApiInternal<DivergenceApi> — scope.around() accesses the `context`
- * field to store middleware in the scope chain.
+ * Created via Effection's createApi() which provides proper middleware
+ * dispatch with WeakMap-based handle caching, automatic cache
+ * invalidation on scope.around(), and a fast-path that skips
+ * middleware dispatch entirely when no middleware is installed.
  *
  * Default behavior is strict: all divergences produce a throw decision
  * with the appropriate error type.
  */
-// deno-lint-ignore no-explicit-any
-export const Divergence: Api<DivergenceApi> & { context: any } = {
-  context: middlewareContext,
-
-  invoke(scope, key, args) {
-    if (key !== "decide") {
-      throw new Error(`Unknown Divergence API method: ${String(key)}`);
-    }
-
-    // Collect middleware from the scope chain using reduce().
-    // This mirrors createApiInternal's createHandle() logic.
-    const $scope = scope as ScopeWithReduce;
-    const { min, max } = $scope.reduce(
-      middlewareContext,
-      (
-        sum: { min: Middleware<[DivergenceInfo], DivergenceDecision>[]; max: Middleware<[DivergenceInfo], DivergenceDecision>[] },
-        current: MiddlewareStore,
-      ) => {
-        const minMiddleware = current.min.flatMap((around) =>
-          around.decide ? [around.decide] : []
-        );
-        const maxMiddleware = current.max.flatMap((around) =>
-          around.decide ? [around.decide] : []
-        );
-        sum.min.push(
-          ...(minMiddleware as Middleware<[DivergenceInfo], DivergenceDecision>[]),
-        );
-        sum.max.unshift(
-          ...(maxMiddleware as Middleware<[DivergenceInfo], DivergenceDecision>[]),
-        );
-        return sum;
-      },
-      {
-        min: [] as Middleware<[DivergenceInfo], DivergenceDecision>[],
-        max: [] as Middleware<[DivergenceInfo], DivergenceDecision>[],
-      },
-    );
-
-    const stack = combineMiddleware(
-      max.concat(min),
-    );
-
-    // deno-lint-ignore no-explicit-any
-    return stack(args as [DivergenceInfo], defaultDecide) as any;
-  },
-
-  // operations and around are not used from Effect.enter() (synchronous path),
-  // but included for Api<A> structural compatibility.
-  // deno-lint-ignore no-explicit-any
-  operations: {} as any,
-
-  // deno-lint-ignore no-explicit-any
-  around: (() => {}) as any,
-};
+export const Divergence: Api<DivergenceApi> = createApi<DivergenceApi>(
+  "DurableEffection.Divergence",
+  { decide: defaultDecide },
+);
