@@ -8,7 +8,7 @@
  * in the second section and bridge the protocol with Effection's runtime.
  */
 
-import type { Scope } from "@effection/effection";
+import type { Result as EffectionResult, Resolve, Scope } from "@effection/effection";
 
 /** Any JSON-serializable value. */
 export type Json =
@@ -74,24 +74,20 @@ export type DurableEvent = Yield | Close;
 
 // ---------------------------------------------------------------------------
 // Effection integration types
+//
+// EffectionResult<T> and Resolve<T> are re-exported from Effection.
+// EffectionResult<T> is an alias for Effection's Result<T>, renamed to
+// avoid collision with our protocol's Result type.
 // ---------------------------------------------------------------------------
 
 /**
- * Effection's internal Result type (distinct from the protocol's Result).
+ * Effection's internal Result type, re-exported under a distinct name to
+ * avoid collision with the protocol's Result type.
  *
  * Effection uses { ok: true, value: T } | { ok: false, error: Error }.
  * The protocol uses { status: "ok" | "err" | "cancelled" }.
- * We re-declare Effection's shape here so types.ts has no Effection imports.
  */
-// TODO this should be replaced with Result from effection
-export type EffectionResult<T> =
-  | { readonly ok: true; value: T }
-  | { readonly ok: false; error: Error };
-
-/**
- * Effection's Resolve callback type.
- */
-export type Resolve<T> = (value: T) => void;
+export type { EffectionResult, Resolve };
 
 /**
  * View of Effection's Coroutine — the fields we need from enter().
@@ -108,12 +104,14 @@ export interface CoroutineView {
  * A DurableEffect extends Effection's Effect interface with a structured
  * `effectDescription` for divergence detection and replay.
  *
- * The `enter()` signature matches Effection 4.1.0-alpha.5's Effect<T> exactly:
- *   enter(resolve: Resolve<EffectionResult<T>>, routine: Coroutine):
- *     (resolve: Resolve<EffectionResult<void>>) => void
+ * The `enter()` signature matches Effection's Effect<T> exactly:
+ *   enter(resolve: Resolve<Result<T>>, routine: Coroutine):
+ *     (resolve: Resolve<Result<void>>) => void
  *
- * DurableEffect<T> is assignable to Effect<T> because it has the same shape
- * plus the extra `effectDescription` field.
+ * DurableEffect<T> is structurally assignable to Effect<T> because it has
+ * the same shape plus the extra `effectDescription` field. We use
+ * CoroutineView (a narrower type than Coroutine) so that contravariance
+ * keeps the assignment valid while documenting our minimal dependency.
  */
 export interface DurableEffect<T> {
   /** Human-readable description (for Effection's Effect interface). */
