@@ -71,3 +71,28 @@ export class ContinuePastCloseDivergenceError extends Error {
     );
   }
 }
+
+/**
+ * Raised by a replay guard when a journal entry's metadata indicates
+ * the recorded result is stale (e.g., the source file has changed since
+ * the effect was originally executed).
+ *
+ * StaleInputError is NOT a divergence — the effect identity matches,
+ * but the external world has changed. The correct response depends on
+ * application policy: re-run from scratch, accept stale results, or
+ * (in future versions) re-execute the effect and continue.
+ *
+ * See replay-guard-spec.md §4.4.
+ */
+export class StaleInputError extends Error {
+  override name = "StaleInputError";
+
+  constructor(
+    /** Human-readable description of what changed. */
+    message: string,
+    /** The Yield event that was detected as stale. */
+    public event?: { coroutineId: string; description: { type: string; name: string } },
+  ) {
+    super(message);
+  }
+}

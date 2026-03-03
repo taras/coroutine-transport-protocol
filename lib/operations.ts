@@ -8,9 +8,25 @@
  * See integration doc §6.
  */
 
-import { createDurableEffect } from "./effect.ts";
+import { createDurableEffect, type DurableEffectOptions } from "./effect.ts";
 import { serializeError } from "./serialize.ts";
 import type { Json, Result, Workflow } from "./types.ts";
+
+/**
+ * Options for durableCall.
+ */
+export interface DurableCallOptions<T> {
+  /**
+   * Generate validation metadata for replay guards.
+   *
+   * Called after the async function resolves, before persisting the Yield
+   * event. The returned object is stored in the event's `meta` field and
+   * passed to replay guards on subsequent runs.
+   *
+   * Example: For a file read, return `{ filePath, fileSHA: sha256(content) }`
+   */
+  meta?: (value: T) => Record<string, Json>;
+}
 
 /**
  * Durable sleep — pauses the workflow for `ms` milliseconds.
@@ -40,11 +56,22 @@ export function* durableSleep(ms: number): Workflow<void> {
  * Description: { type: "call", name }
  *
  * IMPORTANT: The function's return value must be JSON-serializable.
+ *
+ * @param name Stable identifier for the effect (used for divergence detection)
+ * @param fn Async function to execute (only called during live execution)
+ * @param options Optional configuration including metadata generation
  */
 export function* durableCall<T extends Json>(
   name: string,
   fn: () => Promise<T>,
+  options?: DurableCallOptions<T>,
 ): Workflow<T> {
+  // Convert the typed meta function to the untyped version expected by
+  // createDurableEffect
+  const effectOptions: DurableEffectOptions | undefined = options?.meta
+    ? { meta: (value) => options.meta!(value as T) }
+    : undefined;
+
   return (yield createDurableEffect<T>(
     { type: "call", name },
     (resolve) => {
@@ -62,6 +89,7 @@ export function* durableCall<T extends Json>(
       );
       return () => {};
     },
+    effectOptions,
   )) as T;
 }
 

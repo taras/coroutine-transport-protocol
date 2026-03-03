@@ -15,6 +15,8 @@
 
 import { DurableCtx, type DurableContext } from "./context.ts";
 import { Divergence } from "./divergence.ts";
+import { StaleInputError } from "./errors.ts";
+import { ReplayGuard } from "./replay-guard.ts";
 import { protocolToEffection, serializeError } from "./serialize.ts";
 import type {
   DurableEffect,
@@ -22,6 +24,7 @@ import type {
   EffectionResult,
   Resolve,
   Result,
+  Yield,
 } from "./types.ts";
 
 /** Effection void-ok result, used for no-op teardowns. */
@@ -42,14 +45,35 @@ export type Executor = (
 ) => () => void;
 
 /**
+ * Options for createDurableEffect.
+ */
+export interface DurableEffectOptions {
+  /**
+   * Optional metadata generator for replay guards.
+   *
+   * Called after the effect resolves successfully during live execution,
+   * before the Yield event is written. The returned object is stored in
+   * the event's `meta` field and passed to replay guards on subsequent runs.
+   *
+   * Only called when the result is ok — errors and cancellations don't
+   * generate validation metadata.
+   *
+   * Example: For a file read, return `{ filePath, fileSHA: sha256(content) }`
+   */
+  meta?: (value: unknown) => Record<string, import("./types.ts").Json>;
+}
+
+/**
  * Creates a DurableEffect that handles replay/live dispatch internally.
  *
  * @param desc Structured description for the journal and divergence detection
  * @param execute Called only during live execution (skipped during replay)
+ * @param options Optional configuration including metadata generation
  */
 export function createDurableEffect<T>(
   desc: EffectDescription,
   execute: Executor,
+  options?: DurableEffectOptions,
 ): DurableEffect<T> {
   return {
     description: `${desc.type}(${desc.name})`,
@@ -98,7 +122,37 @@ export function createDurableEffect<T>(
             break replay;
           }
 
-          // Description matches — consume the entry and advance cursor
+          // Description matches — now check replay guards before replaying.
+          // ── REPLAY GUARD: Decide phase ──
+          // Runs synchronously, after identity matching but before feeding
+          // the stored result. Middleware returns an outcome based on
+          // observations gathered during the check phase.
+          // See replay-guard-spec.md §5.6.
+          const yieldEvent: Yield = {
+            type: "yield",
+            coroutineId: ctx.coroutineId,
+            description: entry.description,
+            result: entry.result,
+            meta: entry.meta,
+          };
+          const outcome = ReplayGuard.invoke(
+            routine.scope,
+            "decide",
+            [yieldEvent],
+          );
+
+          if (outcome.outcome === "error") {
+            // Guard detected staleness — fail with error
+            ctx.replayIndex.consumeYield(ctx.coroutineId);
+            const error = outcome.error ?? new StaleInputError(
+              `Stale input detected for ${desc.type}("${desc.name}")`,
+              { coroutineId: ctx.coroutineId, description: desc },
+            );
+            resolve({ ok: false, error });
+            return (exit) => exit(VOID_OK);
+          }
+
+          // All guards approved — consume the entry and advance cursor
           ctx.replayIndex.consumeYield(ctx.coroutineId);
 
           // Feed stored result synchronously — no I/O, no side effects.
@@ -140,11 +194,26 @@ export function createDurableEffect<T>(
 
       /** Persist a Yield event then resume the generator. */
       function persistAndResolve(result: Result): void {
-        const event = {
-          type: "yield" as const,
+        // Generate validation metadata for replay guards if:
+        // 1. A meta generator was provided
+        // 2. The result is ok (not err or cancelled)
+        let meta: Record<string, import("./types.ts").Json> | undefined;
+        if (options?.meta && result.status === "ok") {
+          try {
+            meta = options.meta(result.value);
+          } catch {
+            // Meta generation failed — continue without metadata.
+            // This is best-effort; failing to record metadata shouldn't
+            // break the workflow.
+          }
+        }
+
+        const event: Yield = {
+          type: "yield",
           coroutineId: ctx.coroutineId,
           description: desc,
           result,
+          ...(meta && { meta }),
         };
         // Strategy B: buffered write with deferred resume.
         // The generator does not advance until the durable write completes.

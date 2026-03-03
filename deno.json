@@ -14,7 +14,6 @@
   "imports": {
     "@std/assert": "jsr:@std/assert@^1.0.19",
     "@effection/effection": "jsr:@effection/effection@4.1.0-alpha.7",
-    "@effection/effection/experimental": "jsr:@effection/effection@4.1.0-alpha.7/experimental",
     "@durable-streams/client": "npm:@durable-streams/client@0.2.1",
     "@durable-streams/server": "npm:@durable-streams/server@0.2.1"
   },

@@ -14,13 +14,35 @@
  */
 
 import { call, useScope } from "@effection/effection";
-import type { Operation } from "@effection/effection";
+import type { Operation, Scope } from "@effection/effection";
 import { DurableCtx } from "./context.ts";
 import { EarlyReturnDivergenceError } from "./errors.ts";
 import { ReplayIndex } from "./replay-index.ts";
+import { ReplayGuard } from "./replay-guard.ts";
 import { deserializeError, serializeError } from "./serialize.ts";
 import type { DurableStream } from "./stream.ts";
-import type { Close, Json, Workflow } from "./types.ts";
+import type { Close, DurableEvent, Json, Workflow } from "./types.ts";
+
+/**
+ * Run the ReplayGuard check phase over all Yield events.
+ *
+ * This is Phase 1 of replay guard validation — it runs before the workflow
+ * starts, in generator context where I/O is allowed. Middleware uses this
+ * phase to gather observations (hash files, check timestamps) and cache
+ * results for the decide phase.
+ *
+ * See replay-guard-spec.md §5.5.
+ */
+function* runCheckPhase(
+  events: DurableEvent[],
+  scope: Scope,
+): Operation<void> {
+  for (const event of events) {
+    if (event.type === "yield") {
+      yield* ReplayGuard.invoke(scope, "check", [event]);
+    }
+  }
+}
 
 /**
  * Options for durableRun.
@@ -75,8 +97,8 @@ export function* durableRun<T extends Json | void>(
     }
   }
 
-  // Inherit the caller's scope — middleware (e.g., Divergence) is
-  // already installed by the caller before yield*-ing into durableRun.
+  // Inherit the caller's scope — middleware (e.g., Divergence, ReplayGuard)
+  // is already installed by the caller before yield*-ing into durableRun.
   const scope = yield* useScope();
 
   scope.set(DurableCtx, {
@@ -85,6 +107,13 @@ export function* durableRun<T extends Json | void>(
     coroutineId,
     childCounter: 0,
   });
+
+  // ── REPLAY GUARD: Check phase ──
+  // Run before the workflow starts. Middleware can yield* for I/O (hash
+  // files, make network requests) to gather observations for the decide
+  // phase. The check loop iterates all Yield events in journal order.
+  // See replay-guard-spec.md §5.5.
+  yield* runCheckPhase(events, scope);
 
   let closeEvent: Close | undefined;
 

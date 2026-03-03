@@ -50,12 +50,19 @@ export interface EffectDescription {
  * A Yield event — an effect was executed and resolved.
  * Written after an effect resolves. Records both what was requested
  * (description) and what the outcome was (result). See spec §2.1.
+ *
+ * The optional `meta` field stores validation metadata for replay guards
+ * (e.g., file content hashes, timestamps). Not interpreted by the core
+ * protocol — passed through to replay guard middleware for staleness
+ * detection. See replay-guard-spec.md §5.1.
  */
 export interface Yield {
   type: "yield";
   coroutineId: CoroutineId;
   description: EffectDescription;
   result: Result;
+  /** Optional validation metadata for replay guards. */
+  meta?: Record<string, Json>;
 }
 
 /**

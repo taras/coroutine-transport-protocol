@@ -40,6 +40,7 @@ export {
   ContinuePastCloseDivergenceError,
   DivergenceError,
   EarlyReturnDivergenceError,
+  StaleInputError,
 } from "./errors.ts";
 
 // Divergence API — pluggable policy for replay mismatches (DEC-031)
@@ -49,6 +50,13 @@ export type {
   DivergenceInfo,
   DivergenceKind,
 } from "./divergence.ts";
+
+// ReplayGuard API — pluggable validation for replay staleness detection
+export { ReplayGuard } from "./replay-guard.ts";
+export type { ReplayOutcome } from "./replay-guard.ts";
+
+// File content replay guard
+export { useFileContentGuard } from "./file-guard.ts";
 
 // Context
 export { DurableCtx } from "./context.ts";
@@ -64,7 +72,7 @@ export {
 
 // Core effect factory
 export { createDurableEffect } from "./effect.ts";
-export type { Executor } from "./effect.ts";
+export type { DurableEffectOptions, Executor } from "./effect.ts";
 
 // Workflow-enabled effects
 export {
@@ -73,6 +81,7 @@ export {
   durableSleep,
   versionCheck,
 } from "./operations.ts";
+export type { DurableCallOptions } from "./operations.ts";
 
 // Structured concurrency combinators
 export { durableAll, durableRace, durableSpawn } from "./combinators.ts";
