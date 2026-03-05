@@ -2,9 +2,11 @@
  * useFileContentGuard — replay guard for file-backed effects.
  *
  * Detects when a file's content has changed since the journal entry was
- * recorded. Effects store a file path and content hash in their `meta`;
- * this guard recomputes the hash during the check phase and compares
- * during the decide phase.
+ * recorded. Effects store the file path in their description (as an extra
+ * field beyond `type` and `name`) and the content hash in their result
+ * value. This guard reads the path from `event.description.path`, computes
+ * the current hash during the check phase, and compares against
+ * `event.result.value.contentHash` during the decide phase.
  *
  * This is the primary use case for the executable document runtime:
  * if a source file has changed, the system should detect it and error
@@ -33,13 +35,15 @@ async function computeFileHash(filePath: string): Promise<string> {
 /**
  * Install a file content replay guard on the current scope.
  *
- * Effects that read files should store metadata with:
- * - `filePath`: the path to the file that was read
- * - `fileSHA`: the SHA-256 hash of the file's content at read time
+ * Effects that read files should:
+ * - Store the file path as an extra field on the effect description
+ *   (e.g., `{ type: "call", name: "resolve", path: "./component.mdx" }`)
+ * - Return a rich result that includes the content hash alongside the
+ *   content (e.g., `{ content: "...", contentHash: "sha256:abc123" }`)
  *
  * During replay, if the file's current content hash differs from the
- * stored hash, the guard returns an error outcome and replay halts
- * with `StaleInputError`.
+ * hash stored in the result value, the guard returns an error outcome
+ * and replay halts with `StaleInputError`.
  *
  * ## Lifecycle Notes
  *
@@ -62,24 +66,22 @@ async function computeFileHash(filePath: string): Promise<string> {
  *   // Install the guard — children inherit it
  *   yield* useFileContentGuard();
  *
- *   // Effects that store file metadata will be validated on replay
- *   const content = yield* durableCall("readFile", async () => {
+ *   // Effects store path in description, hash in result
+ *   const { content } = yield* durableCall("resolve", async () => {
  *     const data = await Deno.readTextFile("./input.txt");
- *     return data;
- *   }, {
- *     meta: (content) => ({
- *       filePath: "./input.txt",
- *       fileSHA: computeHash(content),
- *     }),
+ *     return { content: data, contentHash: sha256(data) };
  *   });
+ *   // description: { type: "call", name: "resolve", path: "./input.txt" }
+ *   // result: { status: "ok", value: { content: "...", contentHash: "sha256:..." } }
  *
  *   yield* durableRun(innerWorkflow, { stream });
  * }
  * ```
  *
- * Note: The guard only validates events that have `filePath` and `fileSHA`
- * in their metadata. Events without this metadata pass through unchanged
- * (preserving "logs are authoritative" for effects that don't opt in).
+ * Note: The guard only validates events that have `path` in their
+ * description and `contentHash` in their result value. Events without
+ * these fields pass through unchanged (preserving "logs are authoritative"
+ * for effects that don't opt in).
  */
 export function* useFileContentGuard(): Operation<void> {
   const scope = yield* useScope();
@@ -89,19 +91,14 @@ export function* useFileContentGuard(): Operation<void> {
 
   scope.around(ReplayGuard, {
     /**
-     * Phase 1: Check — hash files mentioned in metadata.
+     * Phase 1: Check — hash files mentioned in the effect description.
      *
      * Runs in generator context before replay begins. I/O is allowed.
      * Results are cached for the decide phase.
      */
     *check([event], next): Operation<void> {
-      const meta = event.meta;
-      if (
-        meta &&
-        typeof meta.filePath === "string" &&
-        typeof meta.fileSHA === "string"
-      ) {
-        const filePath = meta.filePath;
+      const filePath = event.description.path;
+      if (typeof filePath === "string") {
         if (!cache.has(filePath)) {
           try {
             const currentSHA = yield* call(() => computeFileHash(filePath));
@@ -121,46 +118,54 @@ export function* useFileContentGuard(): Operation<void> {
      *
      * Must be pure and synchronous — no I/O, no side effects.
      * Reads from the cache populated during check phase.
+     *
+     * Guards access `event.description.path` for the file path (input)
+     * and `event.result.value.contentHash` for the recorded hash (output).
      */
     decide([event], next): ReplayOutcome {
-      const meta = event.meta;
-      if (
-        meta &&
-        typeof meta.filePath === "string" &&
-        typeof meta.fileSHA === "string"
-      ) {
-        const filePath = meta.filePath;
-        const storedSHA = meta.fileSHA;
-        const currentSHA = cache.get(filePath);
+      const filePath = event.description.path;
+      if (typeof filePath !== "string") {
+        // No file path in description — not a file-backed effect
+        return next(event);
+      }
 
-        if (currentSHA === undefined) {
-          // File was unreadable during check (probably deleted)
-          return {
-            outcome: "error",
-            error: new StaleInputError(
-              `File not found or unreadable: ${filePath}`,
-              {
-                coroutineId: event.coroutineId,
-                description: event.description,
-              },
-            ),
-          };
-        }
+      // Read the recorded hash from the result value
+      const resultValue = event.result.status === "ok" ? event.result.value : undefined;
+      const storedHash = (resultValue as Record<string, unknown> | undefined)?.contentHash;
+      if (typeof storedHash !== "string") {
+        // No content hash in result — not a file-backed effect
+        return next(event);
+      }
 
-        if (currentSHA !== storedSHA) {
-          return {
-            outcome: "error",
-            error: new StaleInputError(
-              `File changed: ${filePath} ` +
-                `(recorded: ${storedSHA.slice(0, 8)}..., ` +
-                `current: ${currentSHA.slice(0, 8)}...)`,
-              {
-                coroutineId: event.coroutineId,
-                description: event.description,
-              },
-            ),
-          };
-        }
+      const currentSHA = cache.get(filePath);
+
+      if (currentSHA === undefined) {
+        // File was unreadable during check (probably deleted)
+        return {
+          outcome: "error",
+          error: new StaleInputError(
+            `File not found or unreadable: ${filePath}`,
+            {
+              coroutineId: event.coroutineId,
+              description: event.description,
+            },
+          ),
+        };
+      }
+
+      if (currentSHA !== storedHash) {
+        return {
+          outcome: "error",
+          error: new StaleInputError(
+            `File changed: ${filePath} ` +
+              `(recorded: ${String(storedHash).slice(0, 8)}..., ` +
+              `current: ${currentSHA.slice(0, 8)}...)`,
+            {
+              coroutineId: event.coroutineId,
+              description: event.description,
+            },
+          ),
+        };
       }
 
       // No opinion — delegate to next middleware or default

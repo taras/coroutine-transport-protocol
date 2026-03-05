@@ -81,7 +81,6 @@ export {
   durableSleep,
   versionCheck,
 } from "./operations.ts";
-export type { DurableCallOptions } from "./operations.ts";
 
 // Structured concurrency combinators
 export { durableAll, durableRace, durableSpawn } from "./combinators.ts";

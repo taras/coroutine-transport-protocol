@@ -73,9 +73,13 @@ export class ContinuePastCloseDivergenceError extends Error {
 }
 
 /**
- * Raised by a replay guard when a journal entry's metadata indicates
- * the recorded result is stale (e.g., the source file has changed since
- * the effect was originally executed).
+ * Raised by a replay guard when a journal entry's recorded result is
+ * stale (e.g., the source file has changed since the effect was
+ * originally executed).
+ *
+ * Guards detect staleness by comparing current state against data stored
+ * in the effect description (input fields like file path) and result
+ * value (output fields like content hash).
  *
  * StaleInputError is NOT a divergence — the effect identity matches,
  * but the external world has changed. The correct response depends on

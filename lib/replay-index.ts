@@ -5,13 +5,11 @@
  * to Close events. See spec §4.1.
  */
 
-import type { Close, CoroutineId, DurableEvent, EffectDescription, Json, Result } from "./types.ts";
+import type { Close, CoroutineId, DurableEvent, EffectDescription, Result } from "./types.ts";
 
 export interface YieldEntry {
   description: EffectDescription;
   result: Result;
-  /** Optional validation metadata for replay guards. */
-  meta?: Record<string, Json>;
 }
 
 export class ReplayIndex {
@@ -32,7 +30,6 @@ export class ReplayIndex {
         list.push({
           description: event.description,
           result: event.result,
-          meta: event.meta,
         });
       }
       if (event.type === "close") {

@@ -681,3 +681,30 @@ Updated before completion of every phase and committed at the end of each phase.
 - **Consequences:** Divergence handling is now a pluggable policy rather than a
   hard-coded behavior. The `run-live` decision path enables future code evolution
   scenarios (e.g., "patching" in Temporal's terminology).
+
+## DEC-032: Open EffectDescription replaces meta field for validation data
+
+- **Date:** 2026-03-04
+- **Context:** The ReplayGuard design (replay-guard-spec.md) originally proposed
+  an optional `meta?: Record<string, Json>` field on Yield events to carry
+  validation metadata (file paths, content hashes) for staleness detection.
+  Charles objected to adding meta to the stream. Analysis revealed that meta
+  was solving a problem that doesn't exist: file paths are effect *inputs*
+  and belong in the effect description; content hashes are effect *outputs*
+  and belong in result.value.
+- **Decision:** Remove `meta` from the Yield event type entirely. Open
+  `EffectDescription` to allow extra fields beyond `type` and `name` via
+  an index signature `[key: string]: Json`. Divergence detection continues
+  to compare only `type` and `name` — extra fields are stored verbatim and
+  never checked.
+- **Rationale:** Inputs belong with the description of what was requested.
+  Outputs belong with the result of what was produced. This is the natural
+  separation already established by the protocol. The ReplayGuard middleware
+  reads `event.description.path` for the file path and
+  `event.result.value.contentHash` for the recorded hash — no new protocol
+  fields needed.
+- **Consequences:** The Yield event type loses the `meta` field. Effect
+  implementations that need staleness validation must return rich result
+  objects that include validation data (e.g., content hash alongside content).
+  The protocol remains a two-field `{ type, name }` identity check with
+  open-ended storage for additional context.

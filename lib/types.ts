@@ -38,12 +38,19 @@ export type CoroutineId = string;
 /**
  * Structured effect identity for divergence detection.
  * See spec §6 for matching rules.
+ *
+ * Only `type` and `name` are compared during divergence detection.
+ * Extra fields beyond `type` and `name` are stored verbatim in the
+ * journal but never compared. They exist for runtime use (e.g.,
+ * replay guards reading input parameters like file paths).
  */
 export interface EffectDescription {
   /** Effect category. E.g., "call", "sleep", "action", "spawn", "resource". */
   type: string;
   /** Stable name within the category. E.g., function name, resource label. */
   name: string;
+  /** Extra fields stored verbatim, never compared during divergence detection. */
+  [key: string]: Json;
 }
 
 /**
@@ -51,18 +58,16 @@ export interface EffectDescription {
  * Written after an effect resolves. Records both what was requested
  * (description) and what the outcome was (result). See spec §2.1.
  *
- * The optional `meta` field stores validation metadata for replay guards
- * (e.g., file content hashes, timestamps). Not interpreted by the core
- * protocol — passed through to replay guard middleware for staleness
- * detection. See replay-guard-spec.md §5.1.
+ * Replay guards access `description.*` for input fields (e.g., file path)
+ * and `result.value.*` for output fields (e.g., content hash). There is
+ * no separate metadata field — inputs belong in the effect description,
+ * outputs belong in the result.
  */
 export interface Yield {
   type: "yield";
   coroutineId: CoroutineId;
   description: EffectDescription;
   result: Result;
-  /** Optional validation metadata for replay guards. */
-  meta?: Record<string, Json>;
 }
 
 /**

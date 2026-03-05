@@ -62,6 +62,7 @@ interface Close {
 interface EffectDescription {
   type: string;   // "call", "sleep", "action", etc.
   name: string;   // "fetchOrder", "sleep", etc.
+  [key: string]: Json;  // extra fields stored verbatim, never compared
 }
 
 type Result =
@@ -369,7 +370,9 @@ function createDurableEffect<T>(
 
       if (entry) {
         // ── REPLAY PATH ──
-        // §6.2: Validate description match
+        // §6.2: Validate description match.
+        // Only `type` and `name` are compared — extra fields on
+        // EffectDescription are intentionally not compared.
         if (entry.description.type !== desc.type ||
             entry.description.name !== desc.name) {
           const cursor = ctx.replayIndex.getCursor(ctx.coroutineId);

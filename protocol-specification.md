@@ -160,12 +160,19 @@ type CoroutineId = string;
 /**
  * Structured effect identity for divergence detection.
  * See §6 for matching rules.
+ *
+ * Only `type` and `name` are compared during divergence detection.
+ * Extra fields beyond `type` and `name` are stored verbatim in the
+ * journal but never compared. They exist for runtime use (e.g.,
+ * replay guards reading input parameters like file paths).
  */
 interface EffectDescription {
   /** Effect category. E.g., "call", "sleep", "action", "spawn", "resource". */
   type: string;
   /** Stable name within the category. E.g., function name, resource label. */
   name: string;
+  /** Extra fields stored verbatim, never compared during divergence detection. */
+  [key: string]: Json;
 }
 
 type Result =
@@ -497,11 +504,13 @@ across concurrent children.
 
 During replay, each yielded effect's `EffectDescription` is compared
 against the corresponding journal entry's description. The comparison
-uses the `{ type, name }` structure:
+uses only the `type` and `name` fields — extra fields on
+`EffectDescription` beyond `type` and `name` are never compared during
+divergence detection:
 
 | Yielded | Recorded | Result |
 |---------|----------|--------|
-| Same type, same name | — | **Match.** Consume entry, feed result. |
+| Same type, same name | — | **Match.** Consume entry, feed result. Extra fields are ignored. |
 | Different type | — | **Hard divergence.** Always fatal. |
 | Same type, different name | — | **Hard divergence** (default). Configurable to warning for specific migration scenarios. |
 
@@ -550,6 +559,10 @@ Both cases raise `DivergenceError`.
 
 ### 6.4 What is NOT checked
 
+- **Extra description fields.** Any fields on `EffectDescription` beyond
+  `type` and `name` are stored in the journal but never compared during
+  divergence detection. They exist for runtime use (e.g., staleness
+  validation by replay guards) and are safe to change between versions.
 - **Effect arguments / inputs.** Changes to arguments between versions
   are generally safe. The generator handles whatever value it receives
   from the resolution.

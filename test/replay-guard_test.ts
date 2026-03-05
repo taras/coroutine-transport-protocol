@@ -3,6 +3,11 @@
  *
  * Tests the ReplayGuard API middleware system for detecting stale inputs
  * during replay. See replay-guard-spec.md §9.
+ *
+ * Guards access `event.description.*` for input fields (e.g., file path)
+ * and `event.result.value.*` for output fields (e.g., content hash).
+ * There is no separate `meta` field — inputs belong in the effect
+ * description, outputs belong in the result.
  */
 
 import { assertEquals, assertIsError, assertRejects, assertStringIncludes } from "@std/assert";
@@ -70,11 +75,11 @@ Deno.test("replay guard: no guards installed — normal replay proceeds", async 
 });
 
 // ---------------------------------------------------------------------------
-// Test 2: Guard installed, event has no applicable metadata → replay proceeds
+// Test 2: Guard installed, event has no applicable fields → replay proceeds
 // ---------------------------------------------------------------------------
 
-Deno.test("replay guard: event without metadata — replay proceeds", async () => {
-  // Event has no meta field — guard should pass it through
+Deno.test("replay guard: event without validation fields — replay proceeds", async () => {
+  // Event has no path in description — guard should pass it through
   // Note: NO Close event, so workflow actually runs and replays
   const events: DurableEvent[] = [
     {
@@ -82,7 +87,7 @@ Deno.test("replay guard: event without metadata — replay proceeds", async () =
       coroutineId: "root",
       description: { type: "call", name: "stepA" },
       result: { status: "ok", value: "alpha" },
-      // no meta field
+      // no extra fields in description, no contentHash in result
     },
     // No close event - workflow runs and replays the yield, then executes live close
   ];
@@ -122,27 +127,28 @@ Deno.test("replay guard: event without metadata — replay proceeds", async () =
   // Guard should have seen the event in both phases
   assertEquals(checkEvents.length, 1);
   assertEquals(decideEvents.length, 1);
-  assertEquals(checkEvents[0]!.meta, undefined);
+  // No extra fields in description
+  assertEquals(checkEvents[0]!.description.path, undefined);
 });
 
 // ---------------------------------------------------------------------------
-// Test 3: Meta matches cached value → replay proceeds
+// Test 3: Description path and result hash match → replay proceeds
 // ---------------------------------------------------------------------------
 
-Deno.test("replay guard: meta matches — replay proceeds", async () => {
+Deno.test("replay guard: description/result fields match — replay proceeds", async () => {
   // Simulate a file hash that hasn't changed
+  // path is in description, contentHash is in result.value
   const events: DurableEvent[] = [
     {
       type: "yield",
       coroutineId: "root",
-      description: { type: "call", name: "readFile" },
-      result: { status: "ok", value: "file contents" },
-      meta: { filePath: "./test.txt", fileSHA: "abc123" },
+      description: { type: "call", name: "readFile", path: "./test.txt" },
+      result: { status: "ok", value: { content: "file contents", contentHash: "abc123" } },
     },
     {
       type: "close",
       coroutineId: "root",
-      result: { status: "ok", value: "file contents" },
+      result: { status: "ok", value: { content: "file contents", contentHash: "abc123" } },
     },
   ];
   const stream = new InMemoryStream(events);
@@ -150,7 +156,7 @@ Deno.test("replay guard: meta matches — replay proceeds", async () => {
   // Cache simulates current file having the same hash
   const cache = new Map<string, string>([["./test.txt", "abc123"]]);
 
-  const result = await run(function* (): Operation<string> {
+  const result = await run(function* (): Operation<Record<string, string>> {
     const scope = yield* useScope();
 
     scope.around(ReplayGuard, {
@@ -159,13 +165,15 @@ Deno.test("replay guard: meta matches — replay proceeds", async () => {
         return yield* next(event);
       },
       decide([event], next) {
-        const meta = event.meta;
-        if (meta?.filePath && meta?.fileSHA) {
-          const currentSHA = cache.get(meta.filePath as string);
-          if (currentSHA && currentSHA !== meta.fileSHA) {
+        const filePath = event.description.path;
+        const resultValue = event.result.status === "ok" ? event.result.value : undefined;
+        const recordedHash = (resultValue as Record<string, unknown> | undefined)?.contentHash;
+        if (typeof filePath === "string" && typeof recordedHash === "string") {
+          const currentSHA = cache.get(filePath);
+          if (currentSHA && currentSHA !== recordedHash) {
             return {
               outcome: "error",
-              error: new StaleInputError(`File changed: ${meta.filePath}`),
+              error: new StaleInputError(`File changed: ${filePath}`),
             };
           }
         }
@@ -174,9 +182,9 @@ Deno.test("replay guard: meta matches — replay proceeds", async () => {
     });
 
     return yield* durableRun(
-      function* (): Workflow<string> {
-        return yield* durableCall<string>("readFile", () =>
-          Promise.resolve("should-not-be-called")
+      function* (): Workflow<Record<string, string>> {
+        return yield* durableCall<Record<string, string>>("readFile", () =>
+          Promise.resolve({ content: "should-not-be-called", contentHash: "abc123" })
         );
       },
       { stream },
@@ -184,22 +192,21 @@ Deno.test("replay guard: meta matches — replay proceeds", async () => {
   });
 
   // Replay should proceed since hashes match
-  assertEquals(result, "file contents");
+  assertEquals(result.content, "file contents");
 });
 
 // ---------------------------------------------------------------------------
-// Test 4: Meta differs from cached value → replay errors
+// Test 4: Description path present but result hash differs → replay errors
 // ---------------------------------------------------------------------------
 
-Deno.test("replay guard: meta mismatch — replay errors with StaleInputError", async () => {
-  // File hash in journal differs from current hash
+Deno.test("replay guard: result hash mismatch — replay errors with StaleInputError", async () => {
+  // File hash in journal result differs from current hash
   const events: DurableEvent[] = [
     {
       type: "yield",
       coroutineId: "root",
-      description: { type: "call", name: "readFile" },
-      result: { status: "ok", value: "old contents" },
-      meta: { filePath: "./test.txt", fileSHA: "abc123" },
+      description: { type: "call", name: "readFile", path: "./test.txt" },
+      result: { status: "ok", value: { content: "old contents", contentHash: "abc123" } },
     },
   ];
   const stream = new InMemoryStream(events);
@@ -209,7 +216,7 @@ Deno.test("replay guard: meta mismatch — replay errors with StaleInputError", 
 
   const error = await assertRejects(
     () =>
-      run(function* (): Operation<string> {
+      run(function* (): Operation<Record<string, string>> {
         const scope = yield* useScope();
 
         scope.around(ReplayGuard, {
@@ -217,14 +224,16 @@ Deno.test("replay guard: meta mismatch — replay errors with StaleInputError", 
             return yield* next(event);
           },
           decide([event], next) {
-            const meta = event.meta;
-            if (meta?.filePath && meta?.fileSHA) {
-              const currentSHA = cache.get(meta.filePath as string);
-              if (currentSHA && currentSHA !== meta.fileSHA) {
+            const filePath = event.description.path;
+            const resultValue = event.result.status === "ok" ? event.result.value : undefined;
+            const recordedHash = (resultValue as Record<string, unknown> | undefined)?.contentHash;
+            if (typeof filePath === "string" && typeof recordedHash === "string") {
+              const currentSHA = cache.get(filePath);
+              if (currentSHA && currentSHA !== recordedHash) {
                 return {
                   outcome: "error",
                   error: new StaleInputError(
-                    `File changed: ${meta.filePath} (recorded: ${meta.fileSHA}, current: ${currentSHA})`
+                    `File changed: ${filePath} (recorded: ${recordedHash}, current: ${currentSHA})`
                   ),
                 };
               }
@@ -234,9 +243,9 @@ Deno.test("replay guard: meta mismatch — replay errors with StaleInputError", 
         });
 
         return yield* durableRun(
-          function* (): Workflow<string> {
-            return yield* durableCall<string>("readFile", () =>
-              Promise.resolve("should-not-be-called")
+          function* (): Workflow<Record<string, string>> {
+            return yield* durableCall<Record<string, string>>("readFile", () =>
+              Promise.resolve({ content: "should-not-be-called", contentHash: "abc123" })
             );
           },
           { stream },
@@ -259,9 +268,8 @@ Deno.test("replay guard: multiple guards — error from any guard halts replay",
     {
       type: "yield",
       coroutineId: "root",
-      description: { type: "call", name: "step" },
+      description: { type: "call", name: "step", checkA: "pass", checkB: "fail" },
       result: { status: "ok", value: "result" },
-      meta: { checkA: "pass", checkB: "fail" },
     },
   ];
   const stream = new InMemoryStream(events);
@@ -288,8 +296,7 @@ Deno.test("replay guard: multiple guards — error from any guard halts replay",
             return yield* next(event);
           },
           decide([event], next) {
-            const meta = event.meta;
-            if (meta?.checkB === "fail") {
+            if (event.description.checkB === "fail") {
               return {
                 outcome: "error",
                 error: new StaleInputError("Guard B failed"),
@@ -325,9 +332,8 @@ Deno.test("replay guard: check phase runs before workflow starts", async () => {
     {
       type: "yield",
       coroutineId: "root",
-      description: { type: "call", name: "step" },
+      description: { type: "call", name: "step", someKey: "someValue" },
       result: { status: "ok", value: "result" },
-      meta: { someKey: "someValue" },
     },
     // No close event - workflow runs and replays the yield
   ];
@@ -390,9 +396,8 @@ Deno.test("replay guard: decide is pure — consistent results for same input", 
     {
       type: "yield",
       coroutineId: "root",
-      description: { type: "call", name: "step" },
+      description: { type: "call", name: "step", key: "value" },
       result: { status: "ok", value: "result" },
-      meta: { key: "value" },
     },
     // No close event - workflow runs and replays the yield
   ];
@@ -443,9 +448,8 @@ Deno.test("replay guard: decide not called if identity check fails", async () =>
     {
       type: "yield",
       coroutineId: "root",
-      description: { type: "call", name: "stepA" },
+      description: { type: "call", name: "stepA", key: "value" },
       result: { status: "ok", value: "alpha" },
-      meta: { key: "value" },
     },
   ];
   const stream = new InMemoryStream(events);
@@ -494,16 +498,15 @@ Deno.test("replay guard: decide not called if identity check fails", async () =>
 // ---------------------------------------------------------------------------
 
 Deno.test("replay guard: check deduplicates via cache", async () => {
-  // 5 events all referencing the same file
+  // 5 events all referencing the same file via description.path
   // Note: NO Close event, so workflow actually runs and replays
   const events: DurableEvent[] = [];
   for (let i = 0; i < 5; i++) {
     events.push({
       type: "yield",
       coroutineId: "root",
-      description: { type: "call", name: `step${i}` },
-      result: { status: "ok", value: `result${i}` },
-      meta: { filePath: "./shared.txt", fileSHA: "abc123" },
+      description: { type: "call", name: `step${i}`, path: "./shared.txt" },
+      result: { status: "ok", value: { content: `result${i}`, contentHash: "abc123" } },
     });
   }
   // No close event - workflow runs and replays all yields
@@ -518,11 +521,11 @@ Deno.test("replay guard: check deduplicates via cache", async () => {
 
     scope.around(ReplayGuard, {
       *check([event], next) {
-        const meta = event.meta;
-        if (meta?.filePath && typeof meta.filePath === "string") {
-          if (!cache.has(meta.filePath)) {
+        const filePath = event.description.path;
+        if (typeof filePath === "string") {
+          if (!cache.has(filePath)) {
             hashComputations++;
-            cache.set(meta.filePath, "abc123"); // Simulated hash
+            cache.set(filePath, "abc123"); // Simulated hash
           }
         }
         return yield* next(event);
@@ -535,8 +538,8 @@ Deno.test("replay guard: check deduplicates via cache", async () => {
     return yield* durableRun(
       function* (): Workflow<string> {
         for (let i = 0; i < 5; i++) {
-          yield* durableCall<string>(`step${i}`, () =>
-            Promise.resolve("should-not-be-called")
+          yield* durableCall<Record<string, string>>(`step${i}`, () =>
+            Promise.resolve({ content: "should-not-be-called", contentHash: "abc123" })
           );
         }
         return "done";
@@ -562,9 +565,8 @@ Deno.test("replay guard: guard visible from durableRun scope", async () => {
     {
       type: "yield",
       coroutineId: "root",
-      description: { type: "call", name: "step" },
+      description: { type: "call", name: "step", marker: "stale" },
       result: { status: "ok", value: "result" },
-      meta: { marker: "stale" },
     },
   ];
   const stream = new InMemoryStream(events);
@@ -580,8 +582,8 @@ Deno.test("replay guard: guard visible from durableRun scope", async () => {
             return yield* next(event);
           },
           decide([event], next) {
-            // Always error on events with marker: "stale"
-            if (event.meta?.marker === "stale") {
+            // Always error on events with marker: "stale" in description
+            if (event.description.marker === "stale") {
               return {
                 outcome: "error",
                 error: new StaleInputError("Stale marker detected"),
@@ -613,20 +615,19 @@ Deno.test("replay guard: guard visible from durableRun scope", async () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("replay guard: default behavior is pass-through (logs are authoritative)", async () => {
-  // Event has metadata that WOULD be stale if a guard checked it,
-  // but no guard is installed — should replay normally.
+  // Event has extra description fields that WOULD be stale if a guard
+  // checked them, but no guard is installed — should replay normally.
   const events: DurableEvent[] = [
     {
       type: "yield",
       coroutineId: "root",
-      description: { type: "call", name: "step" },
-      result: { status: "ok", value: "result" },
-      meta: { filePath: "./file.txt", fileSHA: "old-hash-that-no-one-checks" },
+      description: { type: "call", name: "step", path: "./file.txt" },
+      result: { status: "ok", value: { content: "result", contentHash: "old-hash-that-no-one-checks" } },
     },
     {
       type: "close",
       coroutineId: "root",
-      result: { status: "ok", value: "result" },
+      result: { status: "ok", value: { content: "result", contentHash: "old-hash-that-no-one-checks" } },
     },
   ];
   const stream = new InMemoryStream(events);
@@ -634,54 +635,54 @@ Deno.test("replay guard: default behavior is pass-through (logs are authoritativ
   // No guard installed — default behavior
   const result = await run(() =>
     durableRun(
-      function* (): Workflow<string> {
-        return yield* durableCall<string>("step", () =>
-          Promise.resolve("should-not-be-called")
+      function* (): Workflow<Record<string, string>> {
+        return yield* durableCall<Record<string, string>>("step", () =>
+          Promise.resolve({ content: "should-not-be-called", contentHash: "abc123" })
         );
       },
       { stream },
     )
   );
 
-  // Replay proceeds normally — metadata is ignored without guards
-  assertEquals(result, "result");
+  // Replay proceeds normally — extra fields are ignored without guards
+  assertEquals(result.content, "result");
 });
 
 // ---------------------------------------------------------------------------
-// Test 12: Meta is written during live execution
+// Test 12: Rich result with contentHash is written during live execution
 // ---------------------------------------------------------------------------
 
-Deno.test("replay guard: meta is written during live execution", async () => {
+Deno.test("replay guard: rich result with contentHash is written during live execution", async () => {
   const stream = new InMemoryStream([]);
 
   await run(() =>
     durableRun(
-      function* (): Workflow<string> {
-        return yield* durableCall<string>(
+      function* (): Workflow<Record<string, string>> {
+        return yield* durableCall<Record<string, string>>(
           "readFile",
-          () => Promise.resolve("file contents"),
-          {
-            meta: (value) => ({
-              filePath: "./test.txt",
-              fileSHA: `hash-of-${value}`,
-            }),
-          },
+          () => Promise.resolve({
+            content: "file contents",
+            contentHash: "hash-of-file-contents",
+          }),
         );
       },
       { stream },
     )
   );
 
-  // Check that the Yield event has the meta field
+  // Check that the Yield event has the rich result
   const events = await stream.readAll();
   assertEquals(events.length, 2); // yield + close
 
   const yieldEvent = events[0]!;
   assertEquals(yieldEvent.type, "yield");
   if (yieldEvent.type === "yield") {
-    assertEquals(yieldEvent.meta, {
-      filePath: "./test.txt",
-      fileSHA: "hash-of-file contents",
+    assertEquals(yieldEvent.result, {
+      status: "ok",
+      value: {
+        content: "file contents",
+        contentHash: "hash-of-file-contents",
+      },
     });
   }
 });

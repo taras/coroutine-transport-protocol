@@ -48,19 +48,9 @@ export type Executor = (
  * Options for createDurableEffect.
  */
 export interface DurableEffectOptions {
-  /**
-   * Optional metadata generator for replay guards.
-   *
-   * Called after the effect resolves successfully during live execution,
-   * before the Yield event is written. The returned object is stored in
-   * the event's `meta` field and passed to replay guards on subsequent runs.
-   *
-   * Only called when the result is ok — errors and cancellations don't
-   * generate validation metadata.
-   *
-   * Example: For a file read, return `{ filePath, fileSHA: sha256(content) }`
-   */
-  meta?: (value: unknown) => Record<string, import("./types.ts").Json>;
+  // Reserved for future options. The `meta` field was removed in favor of
+  // open EffectDescription (extra fields beyond `type` and `name`) and
+  // rich result values. See DEC-032.
 }
 
 /**
@@ -68,12 +58,12 @@ export interface DurableEffectOptions {
  *
  * @param desc Structured description for the journal and divergence detection
  * @param execute Called only during live execution (skipped during replay)
- * @param options Optional configuration including metadata generation
+ * @param _options Reserved for future options
  */
 export function createDurableEffect<T>(
   desc: EffectDescription,
   execute: Executor,
-  options?: DurableEffectOptions,
+  _options?: DurableEffectOptions,
 ): DurableEffect<T> {
   return {
     description: `${desc.type}(${desc.name})`,
@@ -133,7 +123,6 @@ export function createDurableEffect<T>(
             coroutineId: ctx.coroutineId,
             description: entry.description,
             result: entry.result,
-            meta: entry.meta,
           };
           const outcome = ReplayGuard.invoke(
             routine.scope,
@@ -194,26 +183,11 @@ export function createDurableEffect<T>(
 
       /** Persist a Yield event then resume the generator. */
       function persistAndResolve(result: Result): void {
-        // Generate validation metadata for replay guards if:
-        // 1. A meta generator was provided
-        // 2. The result is ok (not err or cancelled)
-        let meta: Record<string, import("./types.ts").Json> | undefined;
-        if (options?.meta && result.status === "ok") {
-          try {
-            meta = options.meta(result.value);
-          } catch {
-            // Meta generation failed — continue without metadata.
-            // This is best-effort; failing to record metadata shouldn't
-            // break the workflow.
-          }
-        }
-
         const event: Yield = {
           type: "yield",
           coroutineId: ctx.coroutineId,
           description: desc,
           result,
-          ...(meta && { meta }),
         };
         // Strategy B: buffered write with deferred resume.
         // The generator does not advance until the durable write completes.

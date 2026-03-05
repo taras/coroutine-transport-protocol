@@ -3,9 +3,14 @@
  *
  * The durable execution protocol's default behavior is "logs are authoritative"
  * — the journal is unconditionally trusted during replay. ReplayGuard extends
- * this with opt-in validation: effects can attach metadata during live
- * execution, and replay guards can validate that metadata against current
- * state before allowing replay to proceed.
+ * this with opt-in validation: guards can examine effect descriptions and
+ * result values to validate that recorded results are still valid against
+ * current state before allowing replay to proceed.
+ *
+ * Guards access `event.description.*` for effect input fields (e.g., file
+ * path, URL, encoding) and `event.result.value.*` for effect output fields
+ * (e.g., content hash, status code). There is no separate metadata field —
+ * inputs belong in the effect description, outputs belong in the result.
  *
  * The API has two phases:
  *

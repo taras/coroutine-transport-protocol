@@ -145,26 +145,14 @@ This split preserves three invariants:
 
 The prior art survey reveals a universal two-phase pattern: compute a fact about assumptions, then apply a policy. The design implements this as an Effection `Api` with two methods — one for each phase — composed via Effection's native `scope.around()` middleware system.
 
-### 5.1 Metadata on Yield events
+### 5.1 Rich effect descriptions and results
 
-Extend the Yield event with an optional `meta` field:
+Effect inputs and outputs are stored in their natural locations — no separate metadata field is needed:
 
-```typescript
-interface Yield {
-  type: "yield";
-  coroutineId: CoroutineId;
-  description: EffectDescription;
-  result: Result;
-  meta?: Record<string, Json>;  // opaque validation metadata
-}
-```
+- **Effect inputs** (file path, encoding, URL, etc.) belong in extra fields on `EffectDescription`. The `EffectDescription` interface is open: it has `type` and `name` as checked identity fields, plus an index signature `[key: string]: Json` for arbitrary extra fields that are stored verbatim but never compared during divergence detection.
+- **Effect outputs** (content hash, status code, duration, etc.) belong in `result.value`. Effects that need staleness validation return rich result objects that include validation data alongside the actual content.
 
-The `meta` field is:
-
-- **Written at live execution time.** The effect author decides what to store. For a file read: `{ filePath: "./component.mdx", fileSHA: "abc123" }`. For a shell command: `{ commandHash: "def456" }`.
-- **Stored in the journal.** Persists across runs as part of the Yield event.
-- **Not interpreted by the core protocol.** The replay loop passes it through to replay guard middleware but doesn't examine it. No schema, no required fields.
-- **Ignored by identity checking.** The `description` field remains the sole input to divergence detection. `meta` is for replay guards, not identity.
+The `ReplayGuard.check` and `decide` methods read from `event.description.*` for inputs and `event.result.value.*` for outputs. This is the natural separation already established by the protocol: descriptions say what was requested, results say what was produced.
 
 ### 5.2 The ReplayGuard Api
 
@@ -345,30 +333,28 @@ This is the primary use case for the executable document runtime.
 
 > "If the file backing this effect has changed since the journal entry was recorded, replay is no longer safe."
 
-### 6.2 Metadata written at live time
+### 6.2 Rich descriptions and results written at live time
 
-When a file-reading effect resolves during live execution, it writes a content hash into `meta`:
+When a file-reading effect resolves during live execution, the file path is stored as an extra field on the effect description, and the content hash is included in the result value alongside the content:
 
 ```typescript
 function* durableResolve(path: string): Workflow<string> {
-  return yield* durableCall("resolve", async () => {
+  const { content } = yield* durableCall("resolve", async () => {
     const content = await Deno.readTextFile(path);
-    return content;
-  }, {
-    meta: (content) => ({
-      filePath: path,
-      fileSHA: sha256(content),
-    }),
+    return { content, contentHash: sha256(content) };
   });
+  return content;
 }
 ```
 
 Journal entry:
 ```
-yield root { type: "call", name: "resolve" }
-  result: { status: "ok", value: "file contents..." }
-  meta: { filePath: "./component.mdx", fileSHA: "abc123" }
+yield root
+  description: { type: "call", name: "resolve", path: "./component.mdx" }
+  result: { status: "ok", value: { content: "...", contentHash: "sha256:abc123" } }
 ```
+
+The file path is an *input* to the effect and belongs in the description. The content hash is an *output* of the effect and belongs in the result value. Divergence detection only compares `type` and `name` — the extra `path` field is stored verbatim and never checked.
 
 ### 6.3 Middleware implementation
 
@@ -381,9 +367,9 @@ function* useFileContentGuard(): Operation<void> {
 
   scope.around(ReplayGuard, {
     *check([event], next) {
-      const meta = event.meta;
-      if (meta?.filePath && meta?.fileSHA) {
-        const filePath = meta.filePath as string;
+      // check reads input from description
+      const filePath = event.description.path as string | undefined;
+      if (typeof filePath === "string") {
         if (!cache.has(filePath)) {
           // I/O is safe here — we're in generator context, before replay
           const currentSHA = yield* call(() => computeFileHash(filePath));
@@ -395,18 +381,22 @@ function* useFileContentGuard(): Operation<void> {
     },
 
     decide([event], next) {
-      const meta = event.meta;
-      if (meta?.filePath && meta?.fileSHA) {
-        const filePath = meta.filePath as string;
-        const fileSHA = meta.fileSHA as string;
+      // check reads input from description
+      const filePath = event.description.path as string | undefined;
+      // check reads recorded hash from result
+      const resultValue = event.result.status === "ok" ? event.result.value : undefined;
+      const recordedHash = (resultValue as any)?.contentHash as string | undefined;
+
+      if (typeof filePath === "string" && typeof recordedHash === "string") {
+        // decide compares currentHash (from cache) against recordedHash (from result.value)
         const currentSHA = cache.get(filePath);
 
-        if (currentSHA && currentSHA !== fileSHA) {
+        if (currentSHA && currentSHA !== recordedHash) {
           return {
             outcome: "error",
             error: new StaleInputError(
               `File changed: ${filePath} ` +
-              `(recorded: ${fileSHA.slice(0, 8)}…, ` +
+              `(recorded: ${recordedHash.slice(0, 8)}…, ` +
               `current: ${currentSHA.slice(0, 8)}…)`
             ),
           };
@@ -436,21 +426,21 @@ await durableRun(function* () {
 
 **File unchanged:**
 
-1. Check phase: hash `./component.mdx` → `sha256:abc123`. Cache: `{ "./component.mdx" → "abc123" }`.
-2. Replay: identity check passes. `decide` sees `meta.fileSHA === cache.get(filePath)`. Returns `next(event)` (no opinion). Default returns `{ outcome: "replay" }`.
+1. Check phase: read `event.description.path` → `"./component.mdx"`. Hash file → `sha256:abc123`. Cache: `{ "./component.mdx" → "abc123" }`.
+2. Replay: identity check passes. `decide` reads `event.result.value.contentHash` → `"abc123"`, compares to `cache.get(filePath)` → match. Returns `next(event)` (no opinion). Default returns `{ outcome: "replay" }`.
 3. Stored result fed to generator. No re-execution.
 
 **File changed:**
 
-1. Check phase: hash `./component.mdx` → `sha256:def456`. Cache: `{ "./component.mdx" → "def456" }`.
-2. Replay: identity check passes. `decide` sees `meta.fileSHA !== cache.get(filePath)`. Returns `{ outcome: "error" }`.
+1. Check phase: read `event.description.path` → `"./component.mdx"`. Hash file → `sha256:def456`. Cache: `{ "./component.mdx" → "def456" }`.
+2. Replay: identity check passes. `decide` reads `event.result.value.contentHash` → `"abc123"`, compares to `cache.get(filePath)` → mismatch. Returns `{ outcome: "error" }`.
 3. `StaleInputError` propagates through normal Effection error channels.
 
-**File has no metadata:**
+**Effect has no file path in description:**
 
-1. Check phase: `meta?.filePath` is falsy. `check` calls `next(event)` without caching.
-2. Replay: `decide` sees no `filePath` in meta. Calls `next(event)` (no opinion). Default returns `{ outcome: "replay" }`.
-3. Normal replay. Effects without metadata are always replayed — this preserves "logs are authoritative" for effects that don't opt into validation.
+1. Check phase: `event.description.path` is undefined. `check` calls `next(event)` without caching.
+2. Replay: `decide` sees no `path` in description. Calls `next(event)` (no opinion). Default returns `{ outcome: "replay" }`.
+3. Normal replay. Effects without file path data in their description are always replayed — this preserves "logs are authoritative" for effects that don't opt into validation.
 
 ### 6.6 Deduplication
 
@@ -462,7 +452,7 @@ The cache is keyed by `filePath`, so if 20 events reference the same file, the h
 
 ### 7.1 Divergence detection
 
-Identity matching (`description.type` + `description.name` at cursor position) remains the first check. Replay guards only run after identity matching succeeds. If identity matching fails, it's a `DivergenceError` regardless of metadata. The two systems are layered: identity first, then staleness.
+Identity matching (`description.type` + `description.name` at cursor position) remains the first check. Extra fields on `EffectDescription` beyond `type` and `name` are never compared during divergence detection. Replay guards only run after identity matching succeeds. If identity matching fails, it's a `DivergenceError` regardless of what extra fields are present. The two systems are layered: identity first, then staleness.
 
 ### 7.2 Structured concurrency
 
@@ -472,11 +462,11 @@ The check phase runs once in the parent's scope before the workflow starts. All 
 
 ### 7.3 Close events
 
-Close events don't carry `meta` and aren't passed through replay guards. They record terminal states derived from preceding effects. If an effect's stored result is stale, the Close event is also stale — but this is handled by gating the effect, not the Close.
+Close events aren't passed through replay guards. They record terminal states derived from preceding effects. If an effect's stored result is stale, the Close event is also stale — but this is handled by gating the effect, not the Close.
 
 ### 7.4 Durable Streams backend
 
-The `meta` field is additional JSON in the Yield event payload. No changes to the Durable Streams protocol or `HttpDurableStream` adapter. The field serializes and deserializes as part of the event.
+Extra fields on `EffectDescription` are additional JSON stored as part of the description object in the Yield event payload. No changes to the Durable Streams protocol or `HttpDurableStream` adapter. The fields serialize and deserialize as part of the event.
 
 ### 7.5 Version gates
 
@@ -490,9 +480,9 @@ The `DurableContext` does not change. Replay guards are not stored on `DurableCo
 
 ## 8. Version roadmap
 
-### v1: Metadata + error on stale (~100-150 lines)
+### v1: Open EffectDescription + error on stale (~100-150 lines)
 
-- Add optional `meta` field to Yield event type.
+- Open `EffectDescription` to carry extra fields beyond `type` and `name`.
 - Implement `ReplayGuard` Api with `check` and `decide` methods.
 - Implement `StaleInputError` error class.
 - Wire check phase into `durableRun` (loop over events before workflow starts).
@@ -556,33 +546,33 @@ function* useStableGuard(effectNames: string[]): Operation<void> {
 
 ---
 
-### Test 2: Guard installed, event has no applicable metadata → replay proceeds
+### Test 2: Guard installed, event has no applicable fields → replay proceeds
 
-**Setup:** `useFileContentGuard()` installed. Event has no `filePath` in meta (or no meta at all).
+**Setup:** `useFileContentGuard()` installed. Event has no `path` in description (or no `contentHash` in result value).
 
 **Action:** Replay.
 
-**Assert:** `check` runs but caches nothing (no `filePath`). `decide` calls `next(event)` (no opinion). Event replayed normally.
+**Assert:** `check` runs but caches nothing (no `path` in description). `decide` calls `next(event)` (no opinion). Event replayed normally.
 
 ---
 
 ### Test 3: File unchanged → replay proceeds
 
-**Setup:** Event meta: `{ filePath: "./a.mdx", fileSHA: "abc123" }`. File `./a.mdx` currently hashes to `"abc123"`.
+**Setup:** Event description: `{ type: "call", name: "resolve", path: "./a.mdx" }`. Result: `{ status: "ok", value: { content: "...", contentHash: "abc123" } }`. File `./a.mdx` currently hashes to `"abc123"`.
 
 **Action:** Replay.
 
-**Assert:** `check` hashes file, caches `"abc123"`. `decide` sees match, calls `next(event)`. Event replayed. No live execution.
+**Assert:** `check` hashes file, caches `"abc123"`. `decide` reads `description.path` and `result.value.contentHash`, sees match, calls `next(event)`. Event replayed. No live execution.
 
 ---
 
 ### Test 4: File changed → replay errors
 
-**Setup:** Event meta: `{ filePath: "./a.mdx", fileSHA: "abc123" }`. File `./a.mdx` currently hashes to `"def456"`.
+**Setup:** Event description: `{ type: "call", name: "resolve", path: "./a.mdx" }`. Result: `{ status: "ok", value: { content: "...", contentHash: "abc123" } }`. File `./a.mdx` currently hashes to `"def456"`.
 
 **Action:** Replay.
 
-**Assert:** `check` hashes file, caches `"def456"`. `decide` sees mismatch, returns `{ outcome: "error" }`. `StaleInputError` raised. No live execution of this or subsequent effects.
+**Assert:** `check` hashes file, caches `"def456"`. `decide` reads `description.path` and `result.value.contentHash`, sees mismatch, returns `{ outcome: "error" }`. `StaleInputError` raised. No live execution of this or subsequent effects.
 
 ---
 
@@ -628,7 +618,7 @@ function* useStableGuard(effectNames: string[]): Operation<void> {
 
 ### Test 9: Check deduplicates file hashes via cache
 
-**Setup:** Stream has 5 events, all with `meta.filePath: "./a.mdx"`.
+**Setup:** Stream has 5 events, all with `description.path: "./a.mdx"`.
 
 **Action:** Replay.
 
@@ -638,7 +628,7 @@ function* useStableGuard(effectNames: string[]): Operation<void> {
 
 ### Test 10: Guard inherited by child scopes
 
-**Setup:** Parent installs `useFileContentGuard()`. Parent spawns children via `durableAll`. Children have Yield events with file metadata.
+**Setup:** Parent installs `useFileContentGuard()`. Parent spawns children via `durableAll`. Children have Yield events with file path in description and content hash in result value.
 
 **Action:** Replay.
 
@@ -660,9 +650,9 @@ function* useStableGuard(effectNames: string[]): Operation<void> {
 
 **Setup:** No custom guard installed. Just the default `ReplayGuard`.
 
-**Action:** Replay a stream with `meta` fields on events.
+**Action:** Replay a stream with extra description fields on events.
 
-**Assert:** Default `decide` returns `{ outcome: "replay" }` for all events. Metadata is ignored. This confirms "logs are authoritative" as the default.
+**Assert:** Default `decide` returns `{ outcome: "replay" }` for all events. Extra fields are ignored without guards installed. This confirms "logs are authoritative" as the default.
 
 **Note:** Fail-closed means that when a guard *is* installed and detects staleness, the default decision is `error`, not silent continuation. Test 4 verifies this for the file content guard.
 
@@ -693,4 +683,4 @@ The following are explicitly out of scope for the initial implementation:
 
 **The cache-via-closure pattern bridges the I/O boundary.** `check` populates a `Map` in the middleware closure. `decide` reads from it. The closure is the natural bridge between generator context (I/O allowed) and synchronous callbacks (no I/O). No runtime-managed validation context objects.
 
-**Implementation is ~100-150 lines for v1.** The `meta` field on Yield, the `ReplayGuard` Api definition, the decide call in `DurableEffect.enter()`, the check loop in `durableRun`, `StaleInputError`, and `useFileContentGuard()`. The core protocol changes are minimal — two insertion points in existing code.
+**Implementation is ~100-150 lines for v1.** The `ReplayGuard` Api definition, the decide call in `DurableEffect.enter()`, the check loop in `durableRun`, `StaleInputError`, and `useFileContentGuard()`. The core protocol changes are minimal — two insertion points in existing code.
