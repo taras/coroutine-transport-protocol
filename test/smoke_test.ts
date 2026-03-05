@@ -5,6 +5,7 @@
 import { assertEquals } from "@std/assert";
 import { ReplayIndex, InMemoryStream } from "../lib/mod.ts";
 import type { DurableEvent } from "../lib/mod.ts";
+import { test } from "./test-helpers.ts";
 
 Deno.test("ReplayIndex can be constructed with empty events", () => {
   const index = new ReplayIndex([]);
@@ -13,13 +14,12 @@ Deno.test("ReplayIndex can be constructed with empty events", () => {
   assertEquals(index.isFullyReplayed("root"), false);
 });
 
-Deno.test("InMemoryStream starts empty", async () => {
+Deno.test("InMemoryStream starts empty", () => {
   const stream = new InMemoryStream();
-  const events = await stream.readAll();
-  assertEquals(events, []);
+  assertEquals(stream.snapshot(), []);
 });
 
-Deno.test("InMemoryStream stores and retrieves events", async () => {
+test("InMemoryStream stores and retrieves events", function* () {
   const stream = new InMemoryStream();
   const event: DurableEvent = {
     type: "yield",
@@ -27,8 +27,8 @@ Deno.test("InMemoryStream stores and retrieves events", async () => {
     description: { type: "call", name: "fetchOrder" },
     result: { status: "ok", value: 42 },
   };
-  await stream.append(event);
-  const events = await stream.readAll();
+  yield* stream.append(event);
+  const events = stream.snapshot();
   assertEquals(events.length, 1);
   assertEquals(events[0], event);
   assertEquals(stream.appendCount, 1);
