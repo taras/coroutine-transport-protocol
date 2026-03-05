@@ -14,7 +14,6 @@
 
 import {
   all as effectionAll,
-  call,
   race as effectionRace,
   spawn,
   suspend,
@@ -132,9 +131,8 @@ function* runDurableChild<T extends Json | void>(
     // Don't re-emit a Close event if one already exists in the journal
     // (e.g., a cancelled child being replayed via suspend()).
     if (!replayIndex.hasClose(childId)) {
-      // Append the Close event. Use call() to await the promise
-      // within the generator context.
-      yield* call(() => stream.append(closeEvent!));
+      // Append the Close event.
+      yield* stream.append(closeEvent!);
     }
   }
 }

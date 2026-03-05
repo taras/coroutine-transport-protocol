@@ -13,7 +13,7 @@
  * See integration doc §10, protocol spec §4.
  */
 
-import { call, useScope } from "@effection/effection";
+import { useScope } from "@effection/effection";
 import type { Operation, Scope } from "@effection/effection";
 import { DurableCtx } from "./context.ts";
 import { EarlyReturnDivergenceError } from "./errors.ts";
@@ -80,7 +80,7 @@ export function* durableRun<T extends Json | void>(
   const { stream, coroutineId = "root" } = options;
 
   // Read all events and build replay index
-  const events = yield* call(() => stream.readAll());
+  const events = yield* stream.readAll();
   const replayIndex = new ReplayIndex(events);
 
   // If the root coroutine already has a Close event in the journal,
@@ -163,7 +163,7 @@ export function* durableRun<T extends Json | void>(
     // doesn't mask the original workflow error.
     if (closeEvent) {
       try {
-        yield* call(() => stream.append(closeEvent!));
+        yield* stream.append(closeEvent!);
       } catch {
         // Close event append failed — the original error is more important.
       }
