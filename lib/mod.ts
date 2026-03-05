@@ -92,6 +92,9 @@ export { durableAll, durableRace, durableSpawn } from "./combinators.ts";
 export { durableEach } from "./each.ts";
 export type { DurableSource } from "./each.ts";
 
+// Ephemeral — explicit escape hatch for non-durable Operations in Workflows
+export { ephemeral } from "./ephemeral.ts";
+
 // Entry point
 export { durableRun } from "./run.ts";
 export type { DurableRunOptions } from "./run.ts";

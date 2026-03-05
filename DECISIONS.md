@@ -760,3 +760,68 @@ Updated before completion of every phase and committed at the end of each phase.
   which requires a scope. Tests and demos updated to wrap stream creation
   inside `run()`. The `HttpDurableStreamHandle` interface extends
   `DurableStream` with the `lastOffset` property for offset tracking.
+
+## DEC-034: ephemeral() — explicit escape hatch for non-durable Operations in Workflows
+
+- **Date:** 2026-03-04
+- **Context:** The combinators (`durableAll`, `durableRace`, `durableSpawn`)
+  accepted `() => Workflow<T> | Operation<T>` as children (per DEC-021).
+  The `| Operation<T>` part was a type-level loophole — users could pass
+  bare Operations (containing `sleep()`, `fetch()`, etc.) as children
+  whose effects wouldn't be journaled, silently breaking replay correctness.
+  Charles (Effection author) identified that mixing Operations and Workflows
+  should be a compilation error, with an explicit adapter analogous to
+  Rust's `unsafe {}` as the only way to opt in.
+- **Decision:** Introduce `ephemeral<T>(operation: Operation<T>): Workflow<T>`
+  as the explicit escape hatch, and tighten combinator child signatures to
+  accept only `() => Workflow<T>`.
+  - **`ephemeral()`** wraps a non-durable Operation in a `DurableEffect` that
+    is transparent to the journal: no Yield event written, no replay index
+    entry consumed. The Operation runs via `routine.scope.run()` with full
+    structured concurrency. On replay, the Operation simply re-runs.
+  - **Combinator signatures** changed from `() => Workflow<T> | Operation<T>`
+    to `() => Workflow<T>` for `durableAll`, `durableRace`, `durableSpawn`,
+    and the internal `runDurableChild`. Each combinator self-wraps its
+    infrastructure effects (useScope, spawn, all, race) in `ephemeral()`
+    internally, so they return `Workflow<T>` — users never need `ephemeral()`
+    for standard library combinator calls, including nested ones.
+  - **`durableRun`** still accepts `() => Workflow<T> | Operation<T>` because
+    it is the outermost entry point. The dangerous boundary is at the child
+    level inside combinators, not at `durableRun`'s entry point.
+  - **`durableEach`** wraps its infrastructure (ensure) in `ephemeral()`
+    internally and returns `Workflow<Iterable<T>>`. `durableEach.next()`
+    is a pure Workflow (no infrastructure effects) — it reads shared state
+    from a module-level variable rather than Effection context, avoiding
+    the scope isolation problem that arises when both functions are
+    individually wrapped in `ephemeral()` (each gets its own child scope,
+    making context invisible across them).
+- **Rationale:** The primary risk is users passing bare non-durable Operations
+  as children to combinators. By tightening the child signature to
+  `Workflow<T>`, TypeScript rejects `Operation<T>` children at compile time.
+  The `ephemeral()` adapter makes the escape explicit and auditable — every
+  non-durable Operation that participates in a Workflow must go through it.
+  This is analogous to Rust's `unsafe {}` blocks: the boundary is visible in
+  the source code, making it easy to audit where durable guarantees are
+  intentionally relaxed.
+- **Implementation:** `ephemeral()` creates a `DurableEffect` with
+  `description: "ephemeral"` whose `enter()` method runs the wrapped
+  Operation via `routine.scope.run()`. It never calls `checkReplay()`,
+  never appends to the stream, and never advances the replay cursor.
+  Cancellation flows through naturally via Effection's scope hierarchy.
+- **Supersedes:** DEC-021's widening of combinator child signatures.
+  `durableRun`'s parameter type remains widened per DEC-021.
+- **Consequences:** Since combinators self-wrap with `ephemeral()` internally,
+  nested combinator usage works naturally:
+  ```typescript
+  yield* durableAll([
+    function* () {
+      const inner = yield* durableAll([...]);  // no ephemeral() needed
+      return inner.join("+") as string;
+    },
+  ]);
+  ```
+  Users only need `ephemeral()` for their own non-durable Operations inside
+  Workflows — standard library combinators handle it transparently.
+  `durableEach` uses module-level state (safe due to single-threaded
+  execution) rather than Effection context to share state between
+  `durableEach()` and `durableEach.next()`.

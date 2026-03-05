@@ -7,6 +7,7 @@
  */
 
 import { assertEquals, assertIsError } from "@std/assert";
+import type { Operation } from "@effection/effection";
 import {
   durableCall,
   durableEach,
@@ -27,11 +28,12 @@ function arraySource<T extends Json>(items: T[]): DurableSource<T> & { closed: b
   let index = 0;
   const src = {
     closed: false,
-    next(): Promise<{ value: T } | { done: true }> {
+    // deno-lint-ignore require-yield
+    *next(): Operation<{ value: T } | { done: true }> {
       if (index < items.length) {
-        return Promise.resolve({ value: items[index++]! });
+        return { value: items[index++]! };
       }
-      return Promise.resolve({ done: true as const });
+      return { done: true as const };
     },
     close() {
       src.closed = true;
@@ -174,9 +176,10 @@ test("each: full replay — items replayed from journal without calling source",
   // Source should never be called during replay
   let sourceCalled = false;
   const source: DurableSource<string> = {
-    next() {
+    // deno-lint-ignore require-yield
+    *next(): Operation<{ value: string } | { done: true }> {
       sourceCalled = true;
-      return Promise.resolve({ done: true as const });
+      return { done: true as const };
     },
   };
   const processed: string[] = [];
@@ -225,12 +228,13 @@ test("each: crash recovery — partial replay then live", function* () {
   let sourceCallCount = 0;
   let sourceIndex = 2; // start from where replay left off
   const source: DurableSource<string> = {
-    next() {
+    // deno-lint-ignore require-yield
+    *next(): Operation<{ value: string } | { done: true }> {
       sourceCallCount++;
       if (sourceIndex < sourceItems.length) {
-        return Promise.resolve({ value: sourceItems[sourceIndex++]! });
+        return { value: sourceItems[sourceIndex++]! };
       }
-      return Promise.resolve({ done: true as const });
+      return { done: true as const };
     },
   };
   const processed: string[] = [];
@@ -336,8 +340,8 @@ test("each: divergence — mismatched source name", function* () {
 test("each: source error — propagated to workflow", function* () {
   const stream = new InMemoryStream();
   const source: DurableSource<string> = {
-    next() {
-      return Promise.reject(new Error("connection lost"));
+    *next(): Operation<{ value: string } | { done: true }> {
+      throw new Error("connection lost");
     },
   };
 

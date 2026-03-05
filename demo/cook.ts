@@ -22,7 +22,6 @@ import {
   type Workflow,
 } from "../lib/mod.ts";
 import { run } from "@effection/effection";
-import type { Operation } from "@effection/effection";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -80,7 +79,7 @@ function* makeSauce(): Workflow<string> {
 // Dish 2: Focaccia (race: oven timer vs periodic check)
 // ---------------------------------------------------------------------------
 
-function* bakeFocaccia(): Operation<string> {
+function* bakeFocaccia(): Workflow<string> {
   log("🫒", "Mixing dough...");
   yield* durableCall("mix-dough", fakeWork("mix-dough", "dough mixed"));
 
@@ -139,7 +138,7 @@ function* roastVeg(): Workflow<string> {
 // Main: cookDinner — all three dishes in parallel
 // ---------------------------------------------------------------------------
 
-function* cookDinner(): Operation<string> {
+function* cookDinner(): Workflow<string> {
   log("👨‍🍳", "Starting dinner prep — 3 dishes in parallel!");
 
   const results = yield* durableAll([

@@ -5,9 +5,15 @@
  * with DurableContext (coroutine IDs, Close events) so that structured
  * concurrency is fully journaled and replayable.
  *
- * These are Operation generators (not Workflow generators) — they yield
- * both infrastructure effects (useScope, spawn) and durable effects
- * (through child workflows). Only the user's child workflows are Workflows.
+ * Each combinator returns Workflow<T> (not Operation<T>) so it can be
+ * used directly inside a Workflow via yield*. Internally, the infrastructure
+ * effects (useScope, spawn, all, race) are wrapped with ephemeral() —
+ * these are durable-safe operations that set up scope/context and don't
+ * need journaling. See DEC-034.
+ *
+ * Child workflows must be Workflow<T> — bare Operations are rejected at
+ * compile time. Use ephemeral() to explicitly opt in to non-durable
+ * children.
  *
  * See protocol spec §7 (structured concurrency), §10 (race semantics).
  */
@@ -21,6 +27,7 @@ import {
 } from "@effection/effection";
 import type { Operation, Task } from "@effection/effection";
 import { DurableCtx, type DurableContext } from "./context.ts";
+import { ephemeral } from "./ephemeral.ts";
 import { deserializeError, serializeError } from "./serialize.ts";
 import type { Close, Json, Workflow } from "./types.ts";
 
@@ -44,7 +51,7 @@ import type { Close, Json, Workflow } from "./types.ts";
  * The caller is responsible for spawn().
  */
 function* runDurableChild<T extends Json | void>(
-  childWorkflow: () => Workflow<T> | Operation<T>,
+  childWorkflow: () => Workflow<T>,
   childId: string,
   parentCtx: DurableContext,
 ): Operation<T> {
@@ -149,22 +156,29 @@ function* runDurableChild<T extends Json | void>(
  *
  * Returns a Task<T> that can be yield*-ed to get the child's result.
  *
- * Note: This is an Operation (not a Workflow) because it uses infrastructure
- * effects (useScope, spawn). It is meant to be used inside durableAll/durableRace
- * or directly inside a Workflow via yield*.
+ * Returns Workflow<Task<T>> so it can be yield*-ed directly inside a
+ * Workflow. The infrastructure effects (useScope, spawn) are wrapped
+ * with ephemeral() — they are durable-safe scope setup that doesn't
+ * need journaling and re-runs correctly on replay.
  */
 export function* durableSpawn<T extends Json | void>(
-  childWorkflow: () => Workflow<T> | Operation<T>,
-): Operation<Task<T>> {
-  const scope = yield* useScope();
-  const ctx = scope.expect<DurableContext>(DurableCtx);
+  childWorkflow: () => Workflow<T>,
+): Workflow<Task<T>> {
+  // ephemeral wraps the infrastructure Operation (useScope, spawn) so
+  // this combinator satisfies the Workflow<T> return type. The inner
+  // effects are durable-safe — they set up scope context and spawn
+  // children, which is deterministic and idempotent on replay.
+  return yield* ephemeral(function* (): Operation<Task<T>> {
+    const scope = yield* useScope();
+    const ctx = scope.expect<DurableContext>(DurableCtx);
 
-  // Assign deterministic child ID
-  const childIndex = ctx.childCounter++;
-  const childId = `${ctx.coroutineId}.${childIndex}`;
+    // Assign deterministic child ID
+    const childIndex = ctx.childCounter++;
+    const childId = `${ctx.coroutineId}.${childIndex}`;
 
-  // Spawn the child with durable wrapping
-  return yield* spawn(() => runDurableChild(childWorkflow, childId, ctx));
+    // Spawn the child with durable wrapping
+    return yield* spawn(() => runDurableChild(childWorkflow, childId, ctx));
+  }());
 }
 
 // ---------------------------------------------------------------------------
@@ -186,30 +200,36 @@ export function* durableSpawn<T extends Json | void>(
  * See spec §7, §11.5.
  */
 export function* durableAll<T extends Json | void>(
-  workflows: (() => Workflow<T> | Operation<T>)[],
-): Operation<T[]> {
-  const scope = yield* useScope();
-  const ctx = scope.expect<DurableContext>(DurableCtx);
+  workflows: (() => Workflow<T>)[],
+): Workflow<T[]> {
+  // ephemeral wraps the infrastructure Operation (useScope, all) so
+  // this combinator satisfies the Workflow<T[]> return type. The inner
+  // effects are durable-safe — they set up scope context and delegate
+  // to Effection's all(), which is deterministic and idempotent on replay.
+  return yield* ephemeral(function* (): Operation<T[]> {
+    const scope = yield* useScope();
+    const ctx = scope.expect<DurableContext>(DurableCtx);
 
-  // Build child Operations, one per workflow. Each gets its own
-  // deterministic coroutineId and Close event handling.
-  const childOps: Operation<T>[] = workflows.map((workflow) => {
-    const childIndex = ctx.childCounter++;
-    const childId = `${ctx.coroutineId}.${childIndex}`;
+    // Build child Operations, one per workflow. Each gets its own
+    // deterministic coroutineId and Close event handling.
+    const childOps: Operation<T>[] = workflows.map((workflow) => {
+      const childIndex = ctx.childCounter++;
+      const childId = `${ctx.coroutineId}.${childIndex}`;
 
-    return {
-      *[Symbol.iterator]() {
-        return yield* runDurableChild(workflow, childId, ctx);
-      },
-    };
-  });
+      return {
+        *[Symbol.iterator]() {
+          return yield* runDurableChild(workflow, childId, ctx);
+        },
+      };
+    });
 
-  // Delegate to Effection's native all() which uses trap() internally
-  // for proper error isolation. This means:
-  // - Child errors are catchable by the caller via try/catch
-  // - When any child fails, remaining siblings are cancelled
-  // - The error propagates with the original message intact
-  return yield* effectionAll(childOps);
+    // Delegate to Effection's native all() which uses trap() internally
+    // for proper error isolation. This means:
+    // - Child errors are catchable by the caller via try/catch
+    // - When any child fails, remaining siblings are cancelled
+    // - The error propagates with the original message intact
+    return yield* effectionAll(childOps);
+  }());
 }
 
 // ---------------------------------------------------------------------------
@@ -233,27 +253,30 @@ export function* durableAll<T extends Json | void>(
  * See spec §10.
  */
 export function* durableRace<T extends Json | void>(
-  workflows: (() => Workflow<T> | Operation<T>)[],
-): Operation<T> {
-  // Use Effection's native race semantics: wrap each workflow in a
-  // durable child, then race them. Effection's race() spawns all ops
-  // and returns the first to complete, cancelling the rest.
-  const scope = yield* useScope();
-  const ctx = scope.expect<DurableContext>(DurableCtx);
+  workflows: (() => Workflow<T>)[],
+): Workflow<T> {
+  // ephemeral wraps the infrastructure Operation (useScope, race) so
+  // this combinator satisfies the Workflow<T> return type. The inner
+  // effects are durable-safe — they set up scope context and delegate
+  // to Effection's race(), which is deterministic and idempotent on replay.
+  return yield* ephemeral(function* (): Operation<T> {
+    const scope = yield* useScope();
+    const ctx = scope.expect<DurableContext>(DurableCtx);
 
-  // Build Operations for each child — each gets its own coroutineId
-  // and Close event handling via runDurableChild.
-  const childOps: Operation<T>[] = workflows.map((workflow) => {
-    const childIndex = ctx.childCounter++;
-    const childId = `${ctx.coroutineId}.${childIndex}`;
+    // Build Operations for each child — each gets its own coroutineId
+    // and Close event handling via runDurableChild.
+    const childOps: Operation<T>[] = workflows.map((workflow) => {
+      const childIndex = ctx.childCounter++;
+      const childId = `${ctx.coroutineId}.${childIndex}`;
 
-    return {
-      *[Symbol.iterator]() {
-        return yield* runDurableChild(workflow, childId, ctx);
-      },
-    };
-  });
+      return {
+        *[Symbol.iterator]() {
+          return yield* runDurableChild(workflow, childId, ctx);
+        },
+      };
+    });
 
-  // Use Effection's native race() which handles cancellation properly
-  return yield* effectionRace(childOps);
+    // Use Effection's native race() which handles cancellation properly
+    return yield* effectionRace(childOps);
+  }());
 }
