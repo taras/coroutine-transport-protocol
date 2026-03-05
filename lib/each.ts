@@ -198,16 +198,14 @@ function* _durableEachOp<T extends Json>(
 /**
  * Durable iteration over a DurableSource.
  *
- * Wraps the internal Operation in ephemeral() so it returns
- * Workflow<Iterable<T>> and can be yield*-ed inside a Workflow.
- * The infrastructure effect (ensure) is durable-safe — it re-runs
- * correctly on replay.
+ * Returns Workflow<Iterable<T>> via ephemeral() — the infrastructure
+ * effect (ensure) is durable-safe and re-runs correctly on replay.
  */
-function* _durableEach<T extends Json>(
+function _durableEach<T extends Json>(
   name: string,
   source: DurableSource<T>,
 ): Workflow<Iterable<T>> {
-  return yield* ephemeral(_durableEachOp(name, source));
+  return ephemeral(_durableEachOp(name, source));
 }
 
 // ---------------------------------------------------------------------------

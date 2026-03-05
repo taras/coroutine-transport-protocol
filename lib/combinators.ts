@@ -156,19 +156,14 @@ function* runDurableChild<T extends Json | void>(
  *
  * Returns a Task<T> that can be yield*-ed to get the child's result.
  *
- * Returns Workflow<Task<T>> so it can be yield*-ed directly inside a
- * Workflow. The infrastructure effects (useScope, spawn) are wrapped
- * with ephemeral() — they are durable-safe scope setup that doesn't
- * need journaling and re-runs correctly on replay.
+ * Returns Workflow<Task<T>> via ephemeral() — the infrastructure effects
+ * (useScope, spawn) are durable-safe scope setup that doesn't need
+ * journaling and re-runs correctly on replay.
  */
-export function* durableSpawn<T extends Json | void>(
+export function durableSpawn<T extends Json | void>(
   childWorkflow: () => Workflow<T>,
 ): Workflow<Task<T>> {
-  // ephemeral wraps the infrastructure Operation (useScope, spawn) so
-  // this combinator satisfies the Workflow<T> return type. The inner
-  // effects are durable-safe — they set up scope context and spawn
-  // children, which is deterministic and idempotent on replay.
-  return yield* ephemeral(function* (): Operation<Task<T>> {
+  return ephemeral(function* (): Operation<Task<T>> {
     const scope = yield* useScope();
     const ctx = scope.expect<DurableContext>(DurableCtx);
 
@@ -199,14 +194,10 @@ export function* durableSpawn<T extends Json | void>(
  *
  * See spec §7, §11.5.
  */
-export function* durableAll<T extends Json | void>(
+export function durableAll<T extends Json | void>(
   workflows: (() => Workflow<T>)[],
 ): Workflow<T[]> {
-  // ephemeral wraps the infrastructure Operation (useScope, all) so
-  // this combinator satisfies the Workflow<T[]> return type. The inner
-  // effects are durable-safe — they set up scope context and delegate
-  // to Effection's all(), which is deterministic and idempotent on replay.
-  return yield* ephemeral(function* (): Operation<T[]> {
+  return ephemeral(function* (): Operation<T[]> {
     const scope = yield* useScope();
     const ctx = scope.expect<DurableContext>(DurableCtx);
 
@@ -252,14 +243,10 @@ export function* durableAll<T extends Json | void>(
  *
  * See spec §10.
  */
-export function* durableRace<T extends Json | void>(
+export function durableRace<T extends Json | void>(
   workflows: (() => Workflow<T>)[],
 ): Workflow<T> {
-  // ephemeral wraps the infrastructure Operation (useScope, race) so
-  // this combinator satisfies the Workflow<T> return type. The inner
-  // effects are durable-safe — they set up scope context and delegate
-  // to Effection's race(), which is deterministic and idempotent on replay.
-  return yield* ephemeral(function* (): Operation<T> {
+  return ephemeral(function* (): Operation<T> {
     const scope = yield* useScope();
     const ctx = scope.expect<DurableContext>(DurableCtx);
 
