@@ -32,8 +32,11 @@ export type { DurableStream } from "./stream.ts";
 export { InMemoryStream } from "./stream.ts";
 
 // HTTP-backed stream adapter
-export { HttpDurableStream } from "./http-stream.ts";
-export type { HttpDurableStreamOptions } from "./http-stream.ts";
+export { useHttpDurableStream } from "./http-stream.ts";
+export type {
+  HttpDurableStreamHandle,
+  HttpDurableStreamOptions,
+} from "./http-stream.ts";
 
 // Errors
 export {
@@ -70,9 +73,9 @@ export {
   serializeError,
 } from "./serialize.ts";
 
-// Core effect factory
-export { createDurableEffect } from "./effect.ts";
-export type { DurableEffectOptions, Executor } from "./effect.ts";
+// Core effect factories
+export { createDurableEffect, createDurableOperation } from "./effect.ts";
+export type { Executor } from "./effect.ts";
 
 // Workflow-enabled effects
 export {
@@ -88,6 +91,9 @@ export { durableAll, durableRace, durableSpawn } from "./combinators.ts";
 // Durable iteration
 export { durableEach } from "./each.ts";
 export type { DurableSource } from "./each.ts";
+
+// Ephemeral — explicit escape hatch for non-durable Operations in Workflows
+export { ephemeral } from "./ephemeral.ts";
 
 // Entry point
 export { durableRun } from "./run.ts";

@@ -706,5 +706,122 @@ Updated before completion of every phase and committed at the end of each phase.
 - **Consequences:** The Yield event type loses the `meta` field. Effect
   implementations that need staleness validation must return rich result
   objects that include validation data (e.g., content hash alongside content).
-  The protocol remains a two-field `{ type, name }` identity check with
+   The protocol remains a two-field `{ type, name }` identity check with
   open-ended storage for additional context.
+
+## DEC-033: Operation-native HttpDurableStream via resource + Queue + worker
+
+- **Date:** 2026-03-04
+- **Context:** The DurableStream interface was made Operation-native (methods
+  return `Operation<T>` instead of `Promise<T>`) as part of the
+  operation-native-stream branch. HttpDurableStream still used Promise-based
+  methods with a Promise chain for serializing concurrent appends (DEC-027).
+  Simply wrapping the Promise chain with `yield* call()` would work but leaves
+  Promise-based serialization hidden inside an Operation-native interface —
+  not truly structured concurrency.
+- **Options considered:**
+  1. Wrap existing Promise chain with `yield* call()` — minimal change, but
+     the serialization is still Promise-based under the hood
+  2. Channel + spawned worker inside an Effection resource — fully
+     Operation-native, clean cancellation, structured lifecycle
+  3. Hybrid: Queue with deferred/signal per append
+- **Decision:** Option 2. Replace the `HttpDurableStream` class with a
+  `useHttpDurableStream(opts)` resource function that returns
+  `Operation<HttpDurableStreamHandle>`. The resource:
+  1. Creates the stream on the server (PUT) via `yield* call()`
+  2. Creates a `Queue<AppendRequest>` for serializing appends
+  3. Spawns a serial worker that pulls requests from the queue and
+     executes HTTP POSTs one at a time via `yield* call()`
+  4. Uses `withResolvers<void>()` per append so each caller waits for
+     their specific HTTP POST to complete
+  5. Provides the `DurableStream` handle with `readAll()` and `append()`
+     as generator methods
+- **Rationale:** The Queue + worker pattern is idiomatic Effection. The worker's
+  lifetime is bound to the resource scope — when the scope is torn down (e.g.,
+  workflow finishes), the worker is cancelled and no HTTP requests are left
+  dangling. Sequence numbers are still assigned synchronously in `append()`
+  (before the `yield*`), preserving FIFO ordering. The fail-fast pattern is
+  preserved: `fatalError` is checked before enqueuing, and the worker also
+  checks it before each POST. `withResolvers()` bridges the worker's
+  completion back to the specific caller, so errors from a particular append
+  are propagated to the correct caller.
+- **Key primitives used:**
+  - `resource()` — owns the worker scope and provides the stream handle
+  - `createQueue()` — FIFO buffer between concurrent callers and the serial worker
+  - `spawn()` — launches the worker inside the resource scope
+  - `withResolvers()` — per-append completion signaling
+  - `call()` — bridges async fetch/HTTP operations into Operations
+- **Supersedes:** DEC-027's Promise chain serialization. The FIFO ordering
+  guarantee and fail-fast semantics are preserved, but the mechanism is now
+  fully Operation-native.
+- **Consequences:** `HttpDurableStream.connect(opts)` is replaced by
+  `yield* useHttpDurableStream(opts)`. The stream must be created inside an
+  Effection scope. This is natural since it's always used with `durableRun`
+  which requires a scope. Tests and demos updated to wrap stream creation
+  inside `run()`. The `HttpDurableStreamHandle` interface extends
+  `DurableStream` with the `lastOffset` property for offset tracking.
+
+## DEC-034: ephemeral() — explicit escape hatch for non-durable Operations in Workflows
+
+- **Date:** 2026-03-04
+- **Context:** The combinators (`durableAll`, `durableRace`, `durableSpawn`)
+  accepted `() => Workflow<T> | Operation<T>` as children (per DEC-021).
+  The `| Operation<T>` part was a type-level loophole — users could pass
+  bare Operations (containing `sleep()`, `fetch()`, etc.) as children
+  whose effects wouldn't be journaled, silently breaking replay correctness.
+  Charles (Effection author) identified that mixing Operations and Workflows
+  should be a compilation error, with an explicit adapter analogous to
+  Rust's `unsafe {}` as the only way to opt in.
+- **Decision:** Introduce `ephemeral<T>(operation: Operation<T>): Workflow<T>`
+  as the explicit escape hatch, and tighten combinator child signatures to
+  accept only `() => Workflow<T>`.
+  - **`ephemeral()`** wraps a non-durable Operation in a `DurableEffect` that
+    is transparent to the journal: no Yield event written, no replay index
+    entry consumed. The Operation runs via `routine.scope.run()` with full
+    structured concurrency. On replay, the Operation simply re-runs.
+  - **Combinator signatures** changed from `() => Workflow<T> | Operation<T>`
+    to `() => Workflow<T>` for `durableAll`, `durableRace`, `durableSpawn`,
+    and the internal `runDurableChild`. Each combinator self-wraps its
+    infrastructure effects (useScope, spawn, all, race) in `ephemeral()`
+    internally, so they return `Workflow<T>` — users never need `ephemeral()`
+    for standard library combinator calls, including nested ones.
+  - **`durableRun`** still accepts `() => Workflow<T> | Operation<T>` because
+    it is the outermost entry point. The dangerous boundary is at the child
+    level inside combinators, not at `durableRun`'s entry point.
+  - **`durableEach`** wraps its infrastructure (ensure) in `ephemeral()`
+    internally and returns `Workflow<Iterable<T>>`. `durableEach.next()`
+    is a pure Workflow (no infrastructure effects) — it reads shared state
+    from a module-level variable rather than Effection context, avoiding
+    the scope isolation problem that arises when both functions are
+    individually wrapped in `ephemeral()` (each gets its own child scope,
+    making context invisible across them).
+- **Rationale:** The primary risk is users passing bare non-durable Operations
+  as children to combinators. By tightening the child signature to
+  `Workflow<T>`, TypeScript rejects `Operation<T>` children at compile time.
+  The `ephemeral()` adapter makes the escape explicit and auditable — every
+  non-durable Operation that participates in a Workflow must go through it.
+  This is analogous to Rust's `unsafe {}` blocks: the boundary is visible in
+  the source code, making it easy to audit where durable guarantees are
+  intentionally relaxed.
+- **Implementation:** `ephemeral()` creates a `DurableEffect` with
+  `description: "ephemeral"` whose `enter()` method runs the wrapped
+  Operation via `routine.scope.run()`. It never calls `checkReplay()`,
+  never appends to the stream, and never advances the replay cursor.
+  Cancellation flows through naturally via Effection's scope hierarchy.
+- **Supersedes:** DEC-021's widening of combinator child signatures.
+  `durableRun`'s parameter type remains widened per DEC-021.
+- **Consequences:** Since combinators self-wrap with `ephemeral()` internally,
+  nested combinator usage works naturally:
+  ```typescript
+  yield* durableAll([
+    function* () {
+      const inner = yield* durableAll([...]);  // no ephemeral() needed
+      return inner.join("+") as string;
+    },
+  ]);
+  ```
+  Users only need `ephemeral()` for their own non-durable Operations inside
+  Workflows — standard library combinators handle it transparently.
+  `durableEach` uses module-level state (safe due to single-threaded
+  execution) rather than Effection context to share state between
+  `durableEach()` and `durableEach.next()`.

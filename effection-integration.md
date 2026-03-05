@@ -22,20 +22,26 @@ core replay (Tier 1), divergence detection (Tier 2), structured concurrency
   durable-safe effects can be yielded. All `Workflow`s are `Operation`s, but
   not all `Operation`s are `Workflow`s. No casts needed at the boundary (DEC-015).
 - Structured concurrency combinators (`durableSpawn`, `durableAll`,
-  `durableRace`) are `Operation` generators that delegate to Effection's
-  native `spawn()`, `all()`, `race()`. A shared `runDurableChild` helper
-  handles DurableContext setup, Close events, and the `suspend()` trick
-  for replaying cancelled children.
+  `durableRace`) return `Workflow<T>` — they self-wrap their infrastructure
+  effects in `ephemeral()` and delegate to Effection's native `spawn()`,
+  `all()`, `race()`. Child signatures are tightened to `() => Workflow<T>`;
+  bare Operations are rejected at compile time. A shared `runDurableChild`
+  helper handles DurableContext setup, Close events, and the `suspend()`
+  trick for replaying cancelled children.
+- An `ephemeral<T>(operation: Operation<T>): Workflow<T>` adapter provides
+  an explicit escape hatch (analogous to Rust's `unsafe {}`) for running
+  non-durable Operations inside Workflows. It is transparent to the journal
+  and re-runs on replay. See DEC-034.
 - The Durable Streams protocol provides a strong backend fit (see companion
   document `durable-streams.md`).
 
-**Implementation artifacts:** `lib/` contains 10 modules (types, replay-index,
-effect, operations, combinators, run, context, stream, http-stream, serialize)
-plus `mod.ts` as the public API barrel. `test/` contains 7 test files with
-60+ tests across types, replay-index, durable-run (Tier 1), divergence
-(Tier 2), structured-concurrency (Tier 3), deterministic-id (Tier 4), and
-http-stream (backend adapter). 29 architectural decisions recorded in
-`DECISIONS.md`.
+**Implementation artifacts:** `lib/` contains 12 modules (types, replay-index,
+effect, operations, combinators, each, ephemeral, run, context, stream,
+http-stream, serialize) plus `mod.ts` as the public API barrel. `test/`
+contains 9 test files with 95+ tests across types, replay-index,
+durable-run (Tier 1), divergence (Tier 2), structured-concurrency (Tier 3),
+deterministic-id (Tier 4), durable-each, ephemeral, and http-stream (backend
+adapter). 34 architectural decisions recorded in `DECISIONS.md`.
 
 ---
 
@@ -311,14 +317,13 @@ by calling `enter()`, getting a teardown function, and waiting for `resolve()`.
 If it compiles, it's durable. There's no hidden gotcha where "this operation
 looks safe but actually breaks replay."
 
-**Practical nuance: Workflow vs Operation at the top level.** The `Workflow<T>`
-annotation is strictest for leaf-level generators that yield only
-`DurableEffect` values. Generators that use combinators (`durableAll`,
-`durableRace`, `durableSpawn`) are typed as `Operation<T>` because the
-combinators use infrastructure effects internally. `durableRun` accepts
-`Workflow<T> | Operation<T>` to accommodate both. The safety guarantee still
-holds: combinators only accept durable child workflows, so the constraint
-pushes down to the children where it matters most.
+**Uniform Workflow typing.** Combinators (`durableAll`, `durableRace`,
+`durableSpawn`) self-wrap their infrastructure effects in `ephemeral()` and
+return `Workflow<T>`, so top-level workflows that use combinators can also be
+typed as `Workflow<T>`. Child signatures are tightened to `() => Workflow<T>`
+— bare Operations are rejected at compile time. Users who intentionally need
+non-durable Operations inside a Workflow use `ephemeral()` as an explicit
+escape hatch (analogous to Rust's `unsafe {}`). See DEC-034.
 
 ### 4.4 The freeing quality
 
@@ -1027,10 +1032,11 @@ Key details:
   workflow. This is why full-replay tests show zero effect executions and
   zero appends.
 
-- **`Workflow<T> | Operation<T>` union.** Accepts either type. This is
-  pragmatic — combinators are Operations, not Workflows, so a workflow
-  that's just `durableAll(...)` would be an Operation. Structural
-  compatibility means no cast is needed at the `scope.run()` call site.
+- **`Workflow<T> | Operation<T>` union.** Accepts either type. Combinators
+  now return `Workflow<T>` (they self-wrap with `ephemeral()`), so the
+  `Operation<T>` arm is primarily for backward compatibility and edge cases
+  where users pass a raw Operation at the top level. Structural compatibility
+  means no cast is needed at the `scope.run()` call site.
 
 - **Early return divergence check.** After the workflow returns, checks
   if the replay index has unconsumed yields. If so, the generator finished
@@ -1044,7 +1050,7 @@ Key details:
 
 ## 11. What can and cannot be used in workflows (validated)
 
-### 11.1 Two categories of durable operations
+### 11.1 Three categories of durable operations
 
 **Leaf effects** return `Workflow<T>` — they yield a single `DurableEffect`
 and are the atomic units of durable execution:
@@ -1056,9 +1062,10 @@ and are the atomic units of durable execution:
 | `durableAction(name, executor)` | `action(executor)` |
 | `versionCheck(name, opts)` | (new, no equivalent) |
 
-**Combinators** return `Operation<T>` — they use infrastructure effects
-internally (`useScope`, `spawn`) and delegate to Effection's native
-structured concurrency primitives:
+**Combinators** return `Workflow<T>` — they self-wrap their infrastructure
+effects (`useScope`, `spawn`) in `ephemeral()` and delegate to Effection's
+native structured concurrency primitives. Child signatures are tightened to
+`() => Workflow<T>`; bare Operations are rejected at compile time.
 
 | Combinator | Equivalent Effection operation |
 |------------|-------------------------------|
@@ -1066,12 +1073,23 @@ structured concurrency primitives:
 | `durableAll([...workflows])` | `all([...operations])` |
 | `durableRace([...workflows])` | `race([...operations])` |
 
-Combinators return `Operation<T>` rather than `Workflow<T>`, so top-level
-workflows that use them are typed as `Operation<T>`. The infrastructure
-effects resolve synchronously in the reducer and produce no Yield events —
-only the child workflows' `DurableEffect` values appear in the journal.
-`durableRun` accepts the `Workflow<T> | Operation<T>` union, so both
-pure-leaf workflows and combinator-using workflows work seamlessly.
+Because combinators return `Workflow<T>`, top-level workflows that use them
+can also be typed as `Workflow<T>`. The infrastructure effects wrapped in
+`ephemeral()` produce no Yield events — only the child workflows'
+`DurableEffect` values appear in the journal.
+
+**Escape hatch** — `ephemeral<T>(operation: Operation<T>): Workflow<T>` wraps
+a non-durable Operation so it can be used inside a Workflow. It is transparent
+to the journal (no Yield event, no replay index entry) and re-runs on replay.
+This is analogous to Rust's `unsafe {}` — every non-durable Operation that
+participates in a Workflow must go through `ephemeral()`, making the escape
+explicit and auditable. Users rarely need this directly since combinators
+self-wrap internally, but it is available for custom infrastructure
+Operations. See DEC-034.
+
+| Escape hatch | Purpose |
+|-------------|---------|
+| `ephemeral(operation)` | Wrap non-durable Operation for use in Workflow |
 
 ### 11.2 Rejected (type error)
 
@@ -1091,6 +1109,12 @@ whether something is safe for durable execution — the compiler tells you. The
 set of workflow-enabled effects is small and explicit. Each one has a clear
 contract: it carries a structured description, it handles its own replay, and
 its result is JSON-serializable.
+
+If you intentionally need a non-durable Operation inside a Workflow, `ephemeral()`
+makes the boundary visible — every `ephemeral()` call is an auditable point
+where durable guarantees are relaxed. This is the same principle as Rust's
+`unsafe {}`: the type system enforces safety by default, and the escape hatch
+is explicit.
 
 ---
 
@@ -1113,38 +1137,40 @@ Key validations:
 | durableSpawn implementation | ✅ Resolved | Operations using Effection's native spawn/all/race |
 | HTTP backend adapter | ✅ Resolved | Raw fetch writes, promise chain serialization, epoch fencing (DEC-026–029) |
 | Batch persistence | ⏳ Deferred | Optimization for concurrent children, not blocking correctness. See §15.1 |
-| Durable `each()` | ⏳ Future | Design exploration in §12.6 — Option A (yield-per-item) as starting point |
+| Durable `each()` | ✅ Resolved | Operation-native `DurableSource`, module-level state, `ephemeral()` wrapping (DEC-030) |
+| `ephemeral()` escape hatch | ✅ Resolved | Explicit adapter for non-durable Operations in Workflows (DEC-034) |
 | Continue-As-New | ⏳ Future | Journal compaction for long-running loops. Tightly coupled with durableEach. See §15.2 |
 
 ### 12.1 Structured concurrency combinators (resolved)
 
-The combinators are **`Operation` generators, not `DurableEffect`s.** This
-is a significant departure from the earlier design sketches. The key insight:
-combinators don't need to be durable effects because spawns are not journaled.
-They're pure scope plumbing that delegates to Effection's native structured
-concurrency primitives.
+The combinators are **`Workflow` generators that self-wrap with `ephemeral()`,
+not `DurableEffect`s.** This is a significant departure from the earlier
+design sketches. The key insight: combinators don't need to be durable effects
+because spawns are not journaled. They're pure scope plumbing that delegates
+to Effection's native structured concurrency primitives. The `ephemeral()`
+wrapper makes them return `Workflow<T>` so they compose seamlessly with other
+durable operations.
 
 ```typescript
-// durableSpawn, durableAll, durableRace all return Operation<T>
-function* durableSpawn<T extends Json | void>(op): Operation<Task<T>> { ... }
-function* durableAll<T extends Json | void>(ops): Operation<T[]> { ... }
-function* durableRace<T extends Json | void>(ops): Operation<T> { ... }
+// durableSpawn, durableAll, durableRace all return Workflow<T>
+function* durableSpawn<T extends Json | void>(op): Workflow<Task<T>> { ... }
+function* durableAll<T extends Json | void>(ops): Workflow<T[]> { ... }
+function* durableRace<T extends Json | void>(ops): Workflow<T> { ... }
 ```
 
 **How combinators interact with the type system.** A `Workflow<T>` is
 `Generator<DurableEffect<unknown>, T, unknown>` — it constrains what the
-generator *yields*. Combinators return `Operation<T>` because they yield
-infrastructure effects (`useScope()`, `spawn()`) internally. This means
-`yield* durableAll(...)` inside a generator annotated as `Workflow<T>`
-would be a type error — the delegated generator's `Effect<unknown>` yield
-values conflict with the `DurableEffect<unknown>` constraint.
+generator *yields*. Combinators use infrastructure effects (`useScope()`,
+`spawn()`) internally, but wrap them in `ephemeral()` which produces a
+`DurableEffect` (transparent to the journal). This means `yield* durableAll(...)`
+inside a generator annotated as `Workflow<T>` works — the combinators satisfy
+the yield constraint.
 
-In practice, top-level workflows that use combinators are typed as
-`Operation<T>`, not `Workflow<T>`:
+Top-level workflows that use combinators can be typed as `Workflow<T>`:
 
 ```typescript
-// This is typed as Operation<string>, not Workflow<string>
-function* myWorkflow() {
+// This is typed as Workflow<string> — combinators return Workflow<T>
+function* myWorkflow(): Workflow<string> {
   const prefix = yield* durableCall("step1", () => fetchPrefix());
   const results = yield* durableAll([
     function* () { return yield* durableCall("a", () => fetchA()); },
@@ -1154,12 +1180,21 @@ function* myWorkflow() {
 }
 ```
 
-`durableRun` accepts `() => Workflow<T> | Operation<T>`, so this works.
-The `Workflow<T>` annotation is most useful for leaf-level generator
-functions and child workflows passed to combinators — those generators
-only yield `DurableEffect` values and benefit from the compile-time
-constraint. The combinators themselves ensure that only durable-safe
-children are accepted.
+**Child signatures tightened to `() => Workflow<T>`.** Combinators no longer
+accept `Operation<T>` children. This is the primary safety boundary — users
+cannot accidentally pass bare Operations whose effects wouldn't be journaled.
+To intentionally use a non-durable Operation as a child, wrap it in
+`ephemeral()`:
+
+```typescript
+yield* durableAll([
+  function* () { return yield* durableCall("a", () => fetchA()); },
+  function* () {
+    // Explicit escape hatch — this Operation won't be journaled
+    return yield* ephemeral(someInfrastructureOperation());
+  },
+]);
+```
 
 **Why not the DurableEffect-in-enter() approach.** The earlier sketch had
 durableSpawn as a raw `DurableEffect` calling `scope.spawn()` inside
@@ -1175,12 +1210,8 @@ helper that wraps child workflows with DurableContext and Close event
 handling. See §8.1 for the full implementation. This is the single point
 of responsibility for child lifecycle — DurableContext setup, Close event
 short-circuiting, the suspend() trick for cancelled replay, and the
-no-re-emission guard.
-
-**Accepting `Workflow<T> | Operation<T>`.** The combinators accept either
-type for child workflows. This is pragmatic — it allows mixing durable
-and non-durable children when the caller knows what they're doing. The
-`durableRun` entry point also accepts this union.
+no-re-emission guard. Child signatures are `() => Workflow<T>` — matching
+the combinator's public API.
 
 ### 12.2 Serialization boundary (resolved)
 
@@ -1396,15 +1427,15 @@ Edge cases:
 #### Types
 
 ```typescript
-/** Source of items for durable iteration. */
+/** Source of items for durable iteration (Operation-native). */
 interface DurableSource<T extends Json> {
   /** Read the next item, blocking until available. */
-  next(): Promise<{ value: T } | { done: true }>;
-  /** Teardown — called on cancellation or completion. */
+  next(): Operation<{ value: T } | { done: true }>;
+  /** Teardown — called on cancellation or completion. Must be idempotent. */
   close?(): void;
 }
 
-/** State stored in Effection context, shared between durableEach and durableEach.next(). */
+/** State shared between durableEach and durableEach.next(). */
 interface DurableEachState<T extends Json> {
   name: string;
   source: DurableSource<T>;
@@ -1454,104 +1485,110 @@ during replay.
 const DONE = Symbol("durableEach.done");
 type ItemOrDone<T> = T | typeof DONE;
 
-// Effection context for sharing state between durableEach and durableEach.next()
-const DurableEachContext = createContext<DurableEachState<any>>(
-  "durableEach.state",
-);
+// Module-level state for sharing between durableEach and durableEach.next().
+// Safe because durable execution is single-threaded.
+let activeState: DurableEachState<Json> | null = null;
 
 function durableEachFetch<T extends Json>(
   name: string,
   source: DurableSource<T>,
 ): Workflow<ItemOrDone<T>> {
-  return function* () {
-    const result = (yield createDurableEffect<{ value: T } | { done: true }>(
+  return (function* () {
+    const result = (yield createDurableOperation<{ value: T } | { done: true }>(
       { type: "each", name },
-      (resolve) => {
-        source.next().then(
-          (item) => {
-            if ("done" in item) {
-              resolve({ status: "ok", value: { done: true } });
-            } else {
-              resolve({ status: "ok", value: { value: item.value } });
-            }
-          },
-          (error) => {
-            resolve({
-              status: "err",
-              error: serializeError(
-                error instanceof Error ? error : new Error(String(error)),
-              ),
-            });
-          },
-        );
-        return () => source.close?.();
-      },
+      () => source.next(),
     )) as { value: T } | { done: true };
 
     if ("done" in result) return DONE;
     return result.value;
-  }();
+  })();
 }
 
-function* durableEach<T extends Json>(
+// Internal: returns Operation<Iterable<T>> because ensure() is infrastructure
+function* _durableEachOp<T extends Json>(
   name: string,
   source: DurableSource<T>,
-): Workflow<Iterable<T>> {
-  // Durable fetch of first item — journaled as a Yield event
+): Operation<Iterable<T>> {
+  yield* ensure(() => { source.close?.(); });
+
   const first: ItemOrDone<T> = yield* durableEachFetch(name, source);
 
-  // Store state in Effection context for durableEach.next() to access
-  const scope = yield* useScope();
+  // Store state in module-level slot for durableEach.next() to access
   const state: DurableEachState<T> = {
     name,
     source,
     current: first,
     advanced: true,
   };
-  scope.set(DurableEachContext, state);
+  activeState = state as DurableEachState<Json>;
 
   return {
     *[Symbol.iterator]() {
-      while (state.current !== DONE) {
-        if (!state.advanced) {
-          throw new Error(
-            `durableEach("${name}"): yield* durableEach.next() must be ` +
-            `called before the next iteration. Each loop body must end ` +
-            `with yield* durableEach.next() to checkpoint progress and ` +
-            `fetch the next item.`
-          );
+      try {
+        while (!isDone(state.current)) {
+          if (!state.advanced) {
+            throw new Error(
+              `durableEach("${name}"): yield* durableEach.next() must be ` +
+              `called before the next iteration.`
+            );
+          }
+          state.advanced = false;
+          yield state.current as T;
         }
-        state.advanced = false;
-        yield state.current as T;
+      } finally {
+        activeState = null;
+        source.close?.();
       }
     },
   };
 }
 
-// Static method — mirrors Effection's each.next() pattern
-durableEach.next = function* <T extends Json>(): Operation<void> {
-  const scope = yield* useScope();
-  const state = scope.expect(DurableEachContext) as DurableEachState<T>;
-  state.advanced = true;
+// Public API: wraps in ephemeral() to return Workflow<Iterable<T>>
+function* _durableEach<T extends Json>(
+  name: string,
+  source: DurableSource<T>,
+): Workflow<Iterable<T>> {
+  return yield* ephemeral(_durableEachOp(name, source));
+}
+
+// Static method — pure Workflow, no infrastructure effects
+durableEach.next = function* <T extends Json>(): Workflow<void> {
+  if (activeState === null) {
+    throw new Error("durableEach.next(): no active durableEach iteration.");
+  }
+  const state = activeState as DurableEachState<T>;
   state.current = yield* durableEachFetch<T>(state.name, state.source);
+  state.advanced = true;
 };
 ```
 
 Key design choices:
 
-- **Context-based state sharing.** Consistent with Effection's
-  `each()` / `each.next()` pattern. State is stored in an Effection
-  context via `useScope()`, and `durableEach.next()` reads it back
-  from the same context. This means `durableEach.next()` is an
-  `Operation<void>` (not `Workflow<void>`) because `useScope()` is
-  an infrastructure effect. This matches Effection's `each.next()`
-  which is also an Operation.
+- **Module-level state sharing.** State is stored in a module-level
+  `activeState` variable (not Effection context). This is safe because
+  durable execution is single-threaded — only one coroutine runs at a
+  time. This avoids the scope isolation problem that arises when both
+  `durableEach()` and `durableEach.next()` are individually wrapped in
+  `ephemeral()`: each `ephemeral()` call creates an isolated child scope
+  via `scope.run()`, making Effection context set in one child invisible
+  to the other.
 
-- **`durableEach` itself uses `useScope()`.** This means it too
-  becomes an Operation at the type level. In practice, the only
-  infrastructure effect is context setup — all durable effects still
-  go through `createDurableEffect`. The type widening is acceptable
-  for API consistency.
+- **`durableEach` wraps in `ephemeral()`; `durableEach.next()` does not.**
+  `durableEach` uses `ensure()` (an infrastructure Operation), so it
+  needs `ephemeral()` to satisfy the `Workflow<T>` return type.
+  `durableEach.next()` only reads module-level state and calls
+  `durableEachFetch` (a pure `Workflow`), so it is itself a pure `Workflow`
+  with no `ephemeral()` needed.
+
+- **Both return `Workflow<T>`.** Unlike the previous design where both
+  returned `Operation<T>`, the current implementation returns `Workflow<T>`
+  — `durableEach` via `ephemeral()` wrapping, `durableEach.next()` natively.
+  This means they compose cleanly inside `Workflow`-annotated generators.
+
+- **Operation-native `DurableSource.next()`.** The source interface uses
+  `next(): Operation<...>` instead of `next(): Promise<...>`. This enables
+  full structured concurrency — cancellation of the scope cancels the
+  in-flight `source.next()` call via Effection's normal teardown.
 
 - **Symbol sentinel for exhaustion.** `DONE` is a private Symbol,
   not `null` or `undefined`. Cannot collide with any JSON value from
@@ -1676,9 +1713,10 @@ crashes.
    (`test/durable-run_test.ts`).
 7. ~~Run Tier 2 tests~~ — All divergence detection cases passing
    (`test/divergence_test.ts`).
-8. ~~Implement `durableSpawn`, `durableAll`, `durableRace`~~ — Operation
-   generators wrapping Effection's native spawn/all/race, with shared
-   `runDurableChild` helper (`lib/combinators.ts`).
+8. ~~Implement `durableSpawn`, `durableAll`, `durableRace`~~ — Workflow
+    generators that self-wrap infrastructure in `ephemeral()` and delegate
+    to Effection's native spawn/all/race, with shared `runDurableChild`
+    helper. Child signatures tightened to `() => Workflow<T>` (`lib/combinators.ts`).
 9. ~~Run Tier 3 tests~~ — Fork/join, nested scopes, race with
    cancellation, error propagation, partial replay — all passing
    (`test/structured-concurrency_test.ts`).
@@ -1697,23 +1735,25 @@ returns `StreamResponseImpl` where `res.json()` returns a JSON array and
 `res.offset` is a prototype getter for the `Stream-Next-Offset` header.
 Both assumptions confirmed correct. See §12.3 for details.
 
-### Next
-
-12. **Implement `durableEach`.** Durable iteration primitive for
-    long-running consumption. Starting point: Option A (yield-per-item)
-    with the existing interface. See §12.6 for design exploration.
+12. ~~Implement `durableEach`~~ — Durable iteration primitive with
+    Operation-native `DurableSource`, module-level state sharing,
+    `ephemeral()` wrapping. 10 tests passing (`lib/each.ts`,
+    `test/durable-each_test.ts`). DEC-030.
+13. ~~Implement `ephemeral()`~~ — Explicit escape hatch for non-durable
+    Operations inside Workflows. Transparent to the journal. 6 tests
+    passing (`lib/ephemeral.ts`, `test/ephemeral_test.ts`). DEC-034.
 
 ### Future improvements
 
-13. **Batch persistence (Strategy C).** Optimize concurrent child effects
+15. **Batch persistence (Strategy C).** Optimize concurrent child effects
     by batching writes within a single reduce cycle. Becomes a performance
     concern when `durableEach` feeds items into `durableAll` parallel
     processing. See §12.4 and §15.1.
 
-14. **Continue-As-New.** Periodic journal compaction for long-running
+16. **Continue-As-New.** Periodic journal compaction for long-running
     `durableEach` loops. Bounds journal growth. See §15.2.
 
-15. **SSE/long-poll tailing.** `tail(offset)` method on `DurableStream`
+17. **SSE/long-poll tailing.** `tail(offset)` method on `DurableStream`
     for watching live events — needed for external workflow observers
     and multi-worker coordination. See §12.3 on future interface
     evolution. Additive, no changes to existing methods.

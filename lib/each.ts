@@ -14,10 +14,10 @@
  * See effection-integration.md §12.6 for the full design.
  */
 
-import { createContext, ensure, useScope } from "@effection/effection";
-import type { Context, Operation } from "@effection/effection";
-import { createDurableEffect } from "./effect.ts";
-import { serializeError } from "./serialize.ts";
+import { ensure } from "@effection/effection";
+import type { Operation } from "@effection/effection";
+import { createDurableOperation } from "./effect.ts";
+import { ephemeral } from "./ephemeral.ts";
 import type { Json, Workflow } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -35,7 +35,7 @@ import type { Json, Workflow } from "./types.ts";
  */
 export interface DurableSource<T extends Json> {
   /** Read the next item, blocking until available. */
-  next(): Promise<{ value: T } | { done: true }>;
+  next(): Operation<{ value: T } | { done: true }>;
   /**
    * Teardown — called on cancellation or completion.
    *
@@ -59,7 +59,7 @@ function isDone<T>(value: ItemOrDone<T>): value is typeof DONE {
   return value === DONE;
 }
 
-/** State stored in Effection context, shared between durableEach and durableEach.next(). */
+/** State shared between durableEach and durableEach.next(). */
 interface DurableEachState<T extends Json> {
   name: string;
   source: DurableSource<T>;
@@ -68,14 +68,17 @@ interface DurableEachState<T extends Json> {
 }
 
 /**
- * Effection context for sharing state between durableEach() and durableEach.next().
+ * Module-level active state for sharing between durableEach() and durableEach.next().
  *
- * Set on the current scope by durableEach(). Read back by durableEach.next().
- * Both run in the same scope, so context visibility is guaranteed.
+ * Safe because durable execution is single-threaded — only one coroutine
+ * runs at a time, so there's no concurrent access. durableEach() sets this
+ * before returning the iterable; durableEach.next() reads it directly.
+ *
+ * This avoids using Effection context, which doesn't work when both
+ * functions are individually wrapped in ephemeral() (each gets its own
+ * child scope, making context invisible across them).
  */
-const DurableEachContext: Context<DurableEachState<Json>> = createContext<
-  DurableEachState<Json>
->("durableEach.state");
+let activeState: DurableEachState<Json> | null = null;
 
 // ---------------------------------------------------------------------------
 // durableEachFetch — shared helper for fetching one item
@@ -88,6 +91,10 @@ const DurableEachContext: Context<DurableEachState<Json>> = createContext<
  * (inside durableEach.next) go through this helper. Same effect
  * description, same journal format, same replay path.
  *
+ * Uses createDurableOperation to run the source's Operation-native next()
+ * with full structured concurrency — cancellation of the scope cancels
+ * the in-flight source.next() call.
+ *
  * Journal shape: Yield event with description { type: "each", name }
  * and result value { value: T } | { done: true }.
  */
@@ -96,30 +103,9 @@ function durableEachFetch<T extends Json>(
   source: DurableSource<T>,
 ): Workflow<ItemOrDone<T>> {
   return (function* () {
-    const result = (yield createDurableEffect<{ value: T } | { done: true }>(
+    const result = (yield createDurableOperation<{ value: T } | { done: true }>(
       { type: "each", name },
-      (resolve) => {
-        source.next().then(
-          (item) => {
-            if ("done" in item) {
-              resolve({ status: "ok", value: { done: true } });
-            } else {
-              resolve({ status: "ok", value: { value: item.value } as Json });
-            }
-          },
-          (error) => {
-            resolve({
-              status: "err",
-              error: serializeError(
-                error instanceof Error ? error : new Error(String(error)),
-              ),
-            });
-          },
-        );
-        // Effect teardown — close the source on cancellation during
-        // an in-flight source.next() call.
-        return () => source.close?.();
-      },
+      () => source.next(),
     )) as { value: T } | { done: true };
 
     if ("done" in result) return DONE;
@@ -132,29 +118,26 @@ function durableEachFetch<T extends Json>(
 // ---------------------------------------------------------------------------
 
 /**
- * Durable iteration over a DurableSource.
+ * Durable iteration over a DurableSource (internal implementation).
  *
- * Fetches the first item (or replays it), stores state in an Effection
- * context, and returns a synchronous iterable for use with `for...of`.
+ * Returns Operation<Iterable<T>> because it uses ensure() (an
+ * infrastructure Operation). The public API wraps this in ephemeral()
+ * to return Workflow<Iterable<T>>.
  *
- * Each iteration must call `yield* durableEach.next()` at the end of
- * the loop body to checkpoint progress and pre-fetch the next item.
- * Failing to do so triggers a runtime error (advance guard).
- *
- * @param name Stable name for the iteration — used in journal descriptions
- * @param source Async source of items
+ * durableEach and durableEach.next share state through a module-level
+ * variable (activeState). This is safe because durable execution is
+ * single-threaded — only one coroutine runs at a time. This avoids
+ * Effection context, which doesn't work when both functions are
+ * individually wrapped in ephemeral() (each would get its own child
+ * scope, making context invisible across them).
  */
-function* _durableEach<T extends Json>(
+function* _durableEachOp<T extends Json>(
   name: string,
   source: DurableSource<T>,
 ): Operation<Iterable<T>> {
-  // Get scope and register cleanup BEFORE the first fetch, so that
-  // cancellation during the fetch still triggers source teardown.
-  const scope = yield* useScope();
-
-  // Guard against nested durableEach in the same scope — the single
-  // context slot would clobber the outer iteration's state.
-  if (scope.get(DurableEachContext) !== undefined) {
+  // Guard against nested durableEach — the single module-level slot
+  // would clobber the outer iteration's state.
+  if (activeState !== null) {
     throw new Error(
       `durableEach("${name}"): cannot nest durableEach calls in the same ` +
         `scope. Use a child scope (e.g., via spawn) for inner iterations.`,
@@ -171,34 +154,60 @@ function* _durableEach<T extends Json>(
   // ensure() is already registered, so cancellation here is safe.
   const first: ItemOrDone<T> = yield* durableEachFetch(name, source);
 
-  // Store state in Effection context for durableEach.next() to access
+  // Store state in module-level slot for durableEach.next() to access.
+  // Cleared when the iteration completes (done or break).
   const state: DurableEachState<T> = {
     name,
     source,
     current: first,
     advanced: true, // first item was just fetched
   };
-  scope.set(DurableEachContext, state as DurableEachState<Json>);
+  activeState = state as DurableEachState<Json>;
 
   // Return a synchronous iterable. The iterator generator checks
-  // the shared state on each re-entry.
+  // the shared state on each re-entry. The try/finally ensures
+  // source.close() is called when the loop exits — whether by
+  // exhaustion (DONE), break, or throw. This provides immediate
+  // cleanup without waiting for scope teardown (ensure() is still
+  // registered as a safety net for cancellation during fetch).
   return {
     *[Symbol.iterator]() {
-      while (!isDone(state.current)) {
-        // Advance guard: detect missing yield* durableEach.next()
-        if (!state.advanced) {
-          throw new Error(
-            `durableEach("${name}"): yield* durableEach.next() must be ` +
-              `called before the next iteration. Each loop body must end ` +
-              `with yield* durableEach.next() to checkpoint progress and ` +
-              `fetch the next item.`,
-          );
+      try {
+        while (!isDone(state.current)) {
+          // Advance guard: detect missing yield* durableEach.next()
+          if (!state.advanced) {
+            throw new Error(
+              `durableEach("${name}"): yield* durableEach.next() must be ` +
+                `called before the next iteration. Each loop body must end ` +
+                `with yield* durableEach.next() to checkpoint progress and ` +
+                `fetch the next item.`,
+            );
+          }
+          state.advanced = false;
+          yield state.current as T;
         }
-        state.advanced = false;
-        yield state.current as T;
+      } finally {
+        // Clear module-level state so a subsequent durableEach can run.
+        activeState = null;
+        source.close?.();
       }
     },
   };
+}
+
+/**
+ * Durable iteration over a DurableSource.
+ *
+ * Wraps the internal Operation in ephemeral() so it returns
+ * Workflow<Iterable<T>> and can be yield*-ed inside a Workflow.
+ * The infrastructure effect (ensure) is durable-safe — it re-runs
+ * correctly on replay.
+ */
+function* _durableEach<T extends Json>(
+  name: string,
+  source: DurableSource<T>,
+): Workflow<Iterable<T>> {
+  return yield* ephemeral(_durableEachOp(name, source));
 }
 
 // ---------------------------------------------------------------------------
@@ -208,13 +217,19 @@ function* _durableEach<T extends Json>(
 /**
  * Advance the current durable iteration.
  *
- * Reads state from the Effection context (set by durableEach),
- * fetches the next item (or replays it), and updates the shared state.
- * Must be called at the end of each loop body iteration.
+ * Reads state from the module-level activeState slot (set by durableEach).
+ * This is a pure Workflow — no infrastructure effects, no ephemeral()
+ * needed. The only yielded effect is durableEachFetch, which is already
+ * a DurableEffect (journaled).
  */
-function* _durableEachNext<T extends Json>(): Operation<void> {
-  const scope = yield* useScope();
-  const state = scope.expect(DurableEachContext) as DurableEachState<T>;
+function* _durableEachNext<T extends Json>(): Workflow<void> {
+  if (activeState === null) {
+    throw new Error(
+      "durableEach.next(): no active durableEach iteration. " +
+        "durableEach.next() must be called inside a durableEach loop.",
+    );
+  }
+  const state = activeState as DurableEachState<T>;
   // Fetch next item first, then mark advanced. If the fetch throws
   // (source error), advanced stays false and re-entry triggers the
   // advance guard — preventing stale current from being re-yielded.
@@ -229,8 +244,8 @@ function* _durableEachNext<T extends Json>(): Operation<void> {
 /**
  * Durable iteration over a DurableSource.
  *
- * Returns an Operation that fetches the first item and yields a
- * synchronous iterable. Use with `for...of`:
+ * Returns a Workflow that fetches the first item and yields a
+ * synchronous iterable. Use with `for...of` inside a Workflow:
  *
  * ```typescript
  * for (let msg of yield* durableEach("queue", source)) {
@@ -240,12 +255,12 @@ function* _durableEachNext<T extends Json>(): Operation<void> {
  * ```
  *
  * @param name Stable name for the iteration
- * @param source Async source of items
+ * @param source Operation-native source of items
  */
 export const durableEach: {
   <T extends Json>(
     name: string,
     source: DurableSource<T>,
-  ): Operation<Iterable<T>>;
-  next<T extends Json>(): Operation<void>;
+  ): Workflow<Iterable<T>>;
+  next<T extends Json>(): Workflow<void>;
 } = Object.assign(_durableEach, { next: _durableEachNext });

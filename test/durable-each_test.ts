@@ -6,8 +6,8 @@
  * handles break/cancellation, and integrates with durableCall.
  */
 
-import { assertEquals, assertRejects } from "@std/assert";
-import { run } from "@effection/effection";
+import { assertEquals, assertIsError } from "@std/assert";
+import type { Operation } from "@effection/effection";
 import {
   durableCall,
   durableEach,
@@ -17,6 +17,7 @@ import {
   type DurableSource,
   type Json,
 } from "../lib/mod.ts";
+import { test } from "./test-helpers.ts";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -27,11 +28,12 @@ function arraySource<T extends Json>(items: T[]): DurableSource<T> & { closed: b
   let index = 0;
   const src = {
     closed: false,
-    next(): Promise<{ value: T } | { done: true }> {
+    // deno-lint-ignore require-yield
+    *next(): Operation<{ value: T } | { done: true }> {
       if (index < items.length) {
-        return Promise.resolve({ value: items[index++]! });
+        return { value: items[index++]! };
       }
-      return Promise.resolve({ done: true as const });
+      return { done: true as const };
     },
     close() {
       src.closed = true;
@@ -58,12 +60,12 @@ function createCallTracker() {
 // Test 1: Golden run — 3 items
 // ---------------------------------------------------------------------------
 
-Deno.test("each: golden run — 3 items processed, correct journal", async () => {
+test("each: golden run — 3 items processed, correct journal", function* () {
   const stream = new InMemoryStream();
   const source = arraySource(["a", "b", "c"]);
   const processed: string[] = [];
 
-  const result = await run(() => durableRun(
+  const result = yield* durableRun(
     function* () {
       for (const msg of yield* durableEach("queue", source)) {
         processed.push(msg);
@@ -72,13 +74,13 @@ Deno.test("each: golden run — 3 items processed, correct journal", async () =>
       return "done";
     },
     { stream },
-  ));
+  );
 
   assertEquals(result, "done");
   assertEquals(processed, ["a", "b", "c"]);
 
   // Verify journal: 4 each events (a, b, c, done) + 1 root Close
-  const events = await stream.readAll();
+  const events = stream.snapshot();
   const yieldEvents = events.filter((e) => e.type === "yield");
   assertEquals(yieldEvents.length, 4); // 3 items + 1 done sentinel
 
@@ -113,12 +115,12 @@ Deno.test("each: golden run — 3 items processed, correct journal", async () =>
 // Test 2: Empty source — loop body never executes
 // ---------------------------------------------------------------------------
 
-Deno.test("each: empty source — loop body never executes", async () => {
+test("each: empty source — loop body never executes", function* () {
   const stream = new InMemoryStream();
   const source = arraySource<string>([]);
   const processed: string[] = [];
 
-  const result = await run(() => durableRun(
+  const result = yield* durableRun(
     function* () {
       for (const msg of yield* durableEach("empty", source)) {
         processed.push(msg);
@@ -127,13 +129,13 @@ Deno.test("each: empty source — loop body never executes", async () => {
       return "done";
     },
     { stream },
-  ));
+  );
 
   assertEquals(result, "done");
   assertEquals(processed, []);
 
   // Journal: 1 each event (done) + 1 root Close
-  const events = await stream.readAll();
+  const events = stream.snapshot();
   const yieldEvents = events.filter((e) => e.type === "yield");
   assertEquals(yieldEvents.length, 1);
   if (yieldEvents[0]!.type === "yield") {
@@ -145,7 +147,7 @@ Deno.test("each: empty source — loop body never executes", async () => {
 // Test 3: Full replay — no source calls, items replayed from journal
 // ---------------------------------------------------------------------------
 
-Deno.test("each: full replay — items replayed from journal without calling source", async () => {
+test("each: full replay — items replayed from journal without calling source", function* () {
   // Pre-populate stream with all yield events but NO root Close.
   // durableRun will re-run the generator, but all DurableEffects resolve
   // from the replay index — source.next() is never called.
@@ -174,14 +176,15 @@ Deno.test("each: full replay — items replayed from journal without calling sou
   // Source should never be called during replay
   let sourceCalled = false;
   const source: DurableSource<string> = {
-    next() {
+    // deno-lint-ignore require-yield
+    *next(): Operation<{ value: string } | { done: true }> {
       sourceCalled = true;
-      return Promise.resolve({ done: true as const });
+      return { done: true as const };
     },
   };
   const processed: string[] = [];
 
-  const result = await run(() => durableRun(
+  const result = yield* durableRun(
     function* () {
       for (const msg of yield* durableEach("queue", source)) {
         processed.push(msg);
@@ -190,7 +193,7 @@ Deno.test("each: full replay — items replayed from journal without calling sou
       return "done";
     },
     { stream },
-  ));
+  );
 
   // Generator ran but all effects were replayed from journal
   assertEquals(result, "done");
@@ -202,7 +205,7 @@ Deno.test("each: full replay — items replayed from journal without calling sou
 // Test 4: Crash recovery (partial replay)
 // ---------------------------------------------------------------------------
 
-Deno.test("each: crash recovery — partial replay then live", async () => {
+test("each: crash recovery — partial replay then live", function* () {
   // Journal has 2 items replayed, 3rd will be live
   const events: DurableEvent[] = [
     {
@@ -225,17 +228,18 @@ Deno.test("each: crash recovery — partial replay then live", async () => {
   let sourceCallCount = 0;
   let sourceIndex = 2; // start from where replay left off
   const source: DurableSource<string> = {
-    next() {
+    // deno-lint-ignore require-yield
+    *next(): Operation<{ value: string } | { done: true }> {
       sourceCallCount++;
       if (sourceIndex < sourceItems.length) {
-        return Promise.resolve({ value: sourceItems[sourceIndex++]! });
+        return { value: sourceItems[sourceIndex++]! };
       }
-      return Promise.resolve({ done: true as const });
+      return { done: true as const };
     },
   };
   const processed: string[] = [];
 
-  const result = await run(() => durableRun(
+  const result = yield* durableRun(
     function* () {
       for (const msg of yield* durableEach("queue", source)) {
         processed.push(msg);
@@ -244,7 +248,7 @@ Deno.test("each: crash recovery — partial replay then live", async () => {
       return "done";
     },
     { stream },
-  ));
+  );
 
   assertEquals(result, "done");
   assertEquals(processed, ["a", "b", "c"]);
@@ -256,12 +260,12 @@ Deno.test("each: crash recovery — partial replay then live", async () => {
 // Test 5: With durableCall in loop body — interleaved events
 // ---------------------------------------------------------------------------
 
-Deno.test("each: with durableCall in loop — interleaved journal events", async () => {
+test("each: with durableCall in loop — interleaved journal events", function* () {
   const stream = new InMemoryStream();
   const source = arraySource(["msg1", "msg2"]);
   const tracker = createCallTracker();
 
-  await run(() => durableRun(
+  yield* durableRun(
     function* () {
       for (const msg of yield* durableEach("queue", source)) {
         yield* durableCall(`process-${msg}`, tracker.fn(`process-${msg}`, null));
@@ -269,12 +273,12 @@ Deno.test("each: with durableCall in loop — interleaved journal events", async
       }
     },
     { stream },
-  ));
+  );
 
   assertEquals(tracker.calls, ["process-msg1", "process-msg2"]);
 
   // Verify interleaved journal structure
-  const events = await stream.readAll();
+  const events = stream.snapshot();
   const nonClose = events.filter((e) => e.type === "yield");
 
   // each(msg1), call(process-msg1), each(msg2), call(process-msg2), each(done)
@@ -301,7 +305,7 @@ Deno.test("each: with durableCall in loop — interleaved journal events", async
 // Test 6: Divergence detection — source name mismatch
 // ---------------------------------------------------------------------------
 
-Deno.test("each: divergence — mismatched source name", async () => {
+test("each: divergence — mismatched source name", function* () {
   // Journal was recorded with name "queue" but workflow uses "other"
   const events: DurableEvent[] = [
     {
@@ -314,82 +318,82 @@ Deno.test("each: divergence — mismatched source name", async () => {
   const stream = new InMemoryStream(events);
   const source = arraySource(["a"]);
 
-  await assertRejects(
-    () =>
-      run(() => durableRun(
-        function* () {
-          for (const _msg of yield* durableEach("other", source)) {
-            yield* durableEach.next();
-          }
-        },
-        { stream },
-      )),
-    Error,
-    "Divergence",
-  );
+  try {
+    yield* durableRun(
+      function* () {
+        for (const _msg of yield* durableEach("other", source)) {
+          yield* durableEach.next();
+        }
+      },
+      { stream },
+    );
+    throw new Error("expected Divergence error");
+  } catch (e) {
+    assertIsError(e, Error, "Divergence");
+  }
 });
 
 // ---------------------------------------------------------------------------
 // Test 7: Source error — propagated through Effection
 // ---------------------------------------------------------------------------
 
-Deno.test("each: source error — propagated to workflow", async () => {
+test("each: source error — propagated to workflow", function* () {
   const stream = new InMemoryStream();
   const source: DurableSource<string> = {
-    next() {
-      return Promise.reject(new Error("connection lost"));
+    *next(): Operation<{ value: string } | { done: true }> {
+      throw new Error("connection lost");
     },
   };
 
-  await assertRejects(
-    () =>
-      run(() => durableRun(
-        function* () {
-          for (const _msg of yield* durableEach("queue", source)) {
-            yield* durableEach.next();
-          }
-        },
-        { stream },
-      )),
-    Error,
-    "connection lost",
-  );
+  try {
+    yield* durableRun(
+      function* () {
+        for (const _msg of yield* durableEach("queue", source)) {
+          yield* durableEach.next();
+        }
+      },
+      { stream },
+    );
+    throw new Error("expected connection lost error");
+  } catch (e) {
+    assertIsError(e, Error, "connection lost");
+  }
 });
 
 // ---------------------------------------------------------------------------
 // Test 8: Advance guard — missing durableEach.next()
 // ---------------------------------------------------------------------------
 
-Deno.test("each: advance guard — throws when durableEach.next() is missing", async () => {
+test("each: advance guard — throws when durableEach.next() is missing", function* () {
   const stream = new InMemoryStream();
   const source = arraySource(["a", "b"]);
 
-  await assertRejects(
-    () =>
-      run(() => durableRun(
-        function* () {
-          for (const _msg of yield* durableEach("queue", source)) {
-            // Missing: yield* durableEach.next();
-            // The second iteration should trigger the advance guard
-          }
-        },
-        { stream },
-      )),
-    Error,
-    "yield* durableEach.next() must be called",
-  );
+  try {
+    yield* durableRun(
+      function* () {
+        for (const _msg of yield* durableEach("queue", source)) {
+          // Missing: yield* durableEach.next();
+          // The second iteration should trigger the advance guard
+        }
+      },
+      { stream },
+    );
+    throw new Error("expected advance guard error");
+  } catch (e) {
+    assertIsError(e, Error, "yield* durableEach.next() must be called");
+  }
 });
 
 // ---------------------------------------------------------------------------
 // Test 9: Break exits cleanly, source closed
 // ---------------------------------------------------------------------------
 
-Deno.test("each: break exits cleanly and closes source", async () => {
+test("each: break exits cleanly and closes source", function* () {
   const stream = new InMemoryStream();
   const source = arraySource(["a", "b", "c"]);
   const processed: string[] = [];
 
-  const result = await run(() => durableRun(
+  const result = yield* durableRun(
     function* () {
       for (const msg of yield* durableEach("queue", source)) {
         processed.push(msg);
@@ -399,7 +403,7 @@ Deno.test("each: break exits cleanly and closes source", async () => {
       return "stopped";
     },
     { stream },
-  ));
+  );
 
   assertEquals(result, "stopped");
   assertEquals(processed, ["a", "b"]);
@@ -411,12 +415,12 @@ Deno.test("each: break exits cleanly and closes source", async () => {
 // Test 10: Null values in source — not confused with done signal
 // ---------------------------------------------------------------------------
 
-Deno.test("each: null values are valid items, not done signals", async () => {
+test("each: null values are valid items, not done signals", function* () {
   const stream = new InMemoryStream();
   const source = arraySource<Json>([null, "after-null", null]);
   const processed: Json[] = [];
 
-  const result = await run(() => durableRun(
+  const result = yield* durableRun(
     function* () {
       for (const msg of yield* durableEach("queue", source)) {
         processed.push(msg);
@@ -425,13 +429,13 @@ Deno.test("each: null values are valid items, not done signals", async () => {
       return "done";
     },
     { stream },
-  ));
+  );
 
   assertEquals(result, "done");
   assertEquals(processed, [null, "after-null", null]);
 
   // Verify journal stores { value: null } not { done: true }
-  const events = await stream.readAll();
+  const events = stream.snapshot();
   const yieldEvents = events.filter((e) => e.type === "yield");
   if (yieldEvents[0]!.type === "yield") {
     assertEquals(yieldEvents[0]!.result, { status: "ok", value: { value: null } });
