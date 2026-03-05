@@ -5,6 +5,7 @@
  * does not prescribe a physical encoding or transport.
  */
 
+import type { Operation } from "@effection/effection";
 import type { DurableEvent } from "./types.ts";
 
 /**
@@ -18,13 +19,13 @@ import type { DurableEvent } from "./types.ts";
  */
 export interface DurableStream {
   /** Read all events in the stream, in append order. */
-  readAll(): Promise<DurableEvent[]>;
+  readAll(): Operation<DurableEvent[]>;
 
   /**
    * Append an event to the stream.
-   * The returned promise resolves only after the event is durably persisted.
+   * The returned operation completes only after the event is durably persisted.
    */
-  append(event: DurableEvent): Promise<void>;
+  append(event: DurableEvent): Operation<void>;
 }
 
 /**
@@ -50,18 +51,19 @@ export class InMemoryStream implements DurableStream {
     this.events = [...initialEvents];
   }
 
-  readAll(): Promise<DurableEvent[]> {
-    return Promise.resolve([...this.events]);
+  // deno-lint-ignore require-yield
+  *readAll(): Operation<DurableEvent[]> {
+    return [...this.events];
   }
 
-  append(event: DurableEvent): Promise<void> {
+  // deno-lint-ignore require-yield
+  *append(event: DurableEvent): Operation<void> {
     if (this.injectFailure) {
-      return Promise.reject(this.injectFailure);
+      throw this.injectFailure;
     }
     this.onAppend?.(event);
     this.events.push(event);
     this.appendCount++;
-    return Promise.resolve();
   }
 
   /** Get a snapshot of current events (for test assertions). */
