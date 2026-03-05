@@ -8,9 +8,10 @@
  * See integration doc §6.
  */
 
-import { createDurableEffect } from "./effect.ts";
-import { serializeError } from "./serialize.ts";
-import type { Json, Result, Workflow } from "./types.ts";
+import { call } from "@effection/effection";
+import type { Operation } from "@effection/effection";
+import { createDurableEffect, createDurableOperation } from "./effect.ts";
+import type { Json, Workflow } from "./types.ts";
 
 /**
  * Durable sleep — pauses the workflow for `ms` milliseconds.
@@ -31,7 +32,11 @@ export function* durableSleep(ms: number): Workflow<void> {
 }
 
 /**
- * Durable call — wraps an async function for durable execution.
+ * Durable call — wraps a function for durable execution.
+ *
+ * Accepts functions returning either a Promise or an Operation.
+ * Effection's call() handles the dispatch at runtime: Promises are
+ * bridged, Operations run with full structured concurrency.
  *
  * The function is called during live execution; its resolved value is
  * serialized and persisted. During replay, the stored value is returned
@@ -42,29 +47,20 @@ export function* durableSleep(ms: number): Workflow<void> {
  * IMPORTANT: The function's return value must be JSON-serializable.
  *
  * @param name Stable identifier for the effect (used for divergence detection)
- * @param fn Async function to execute (only called during live execution)
+ * @param fn Function returning a Promise or Operation (only called during live execution)
  */
 export function* durableCall<T extends Json>(
   name: string,
-  fn: () => Promise<T>,
+  fn: () => Promise<T> | Operation<T>,
 ): Workflow<T> {
-  return (yield createDurableEffect<T>(
+  // call() dispatches at runtime: if fn() returns a Promise, it bridges
+  // via action(); if it returns an Operation, it evaluates directly.
+  // The cast is safe because call() always resolves to T regardless of
+  // which branch fn() takes.
+  return (yield createDurableOperation<T>(
     { type: "call", name },
-    (resolve) => {
-      fn().then(
-        (value) => resolve({ status: "ok", value: value as Json }),
-        (error) => {
-          const result: Result = {
-            status: "err",
-            error: serializeError(
-              error instanceof Error ? error : new Error(String(error)),
-            ),
-          };
-          resolve(result);
-        },
-      );
-      return () => {};
-    },
+    // deno-lint-ignore no-explicit-any
+    () => call(fn as any) as Operation<T>,
   )) as T;
 }
 

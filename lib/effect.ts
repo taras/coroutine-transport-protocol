@@ -1,10 +1,17 @@
 /**
- * createDurableEffect — the core factory for durable effects.
+ * createDurableEffect / createDurableOperation — core factories for durable effects.
  *
  * Each DurableEffect handles its own replay/live dispatch inside enter().
  * It reads DurableContext from the scope, checks the replay index, and
  * either feeds the stored result (replay) or executes live with
  * persist-before-resume semantics.
+ *
+ * Two factories are provided:
+ * - createDurableEffect: callback-based executor (resolve/reject/teardown)
+ *   for timer-like and callback-based APIs (durableSleep, durableAction).
+ * - createDurableOperation: Operation-based executor for structured
+ *   concurrency. The live path runs entirely as a generator — execute,
+ *   capture result, persist, resolve. No callbacks, no .then().
  *
  * Divergence policy is delegated to the Divergence API (DEC-031).
  * By default, mismatches are fatal. Users can install middleware via
@@ -13,15 +20,18 @@
  * See integration doc §5.1, protocol spec §4.2, §5, §6.
  */
 
+import type { Operation } from "@effection/effection";
 import { DurableCtx, type DurableContext } from "./context.ts";
 import { Divergence } from "./divergence.ts";
 import { StaleInputError } from "./errors.ts";
 import { ReplayGuard } from "./replay-guard.ts";
 import { protocolToEffection, serializeError } from "./serialize.ts";
 import type {
+  CoroutineView,
   DurableEffect,
   EffectDescription,
   EffectionResult,
+  Json,
   Resolve,
   Result,
   Yield,
@@ -31,7 +41,7 @@ import type {
 const VOID_OK: EffectionResult<void> = { ok: true, value: undefined as void };
 
 /**
- * Executor function signature for live execution.
+ * Executor function signature for live execution (callback-based).
  *
  * The executor receives:
  * - resolve: call with a protocol Result when the effect completes
@@ -44,12 +54,141 @@ export type Executor = (
   reject: (error: Error) => void,
 ) => () => void;
 
+// ---------------------------------------------------------------------------
+// Shared replay path
+// ---------------------------------------------------------------------------
+
 /**
- * Creates a DurableEffect that handles replay/live dispatch internally.
+ * Result of the replay check: either the effect was replayed (and enter()
+ * should return immediately) or the live path should execute.
+ */
+type ReplayResult<T> =
+  | { path: "replayed"; teardown: (resolve: Resolve<EffectionResult<void>>) => void }
+  | { path: "live" };
+
+/**
+ * Shared replay logic for both createDurableEffect and createDurableOperation.
+ *
+ * Checks the replay index for a matching entry, runs divergence detection,
+ * and runs replay guards. If replay succeeds, resolves the generator
+ * synchronously and returns "replayed". Otherwise returns "live" to
+ * indicate the caller should execute the effect.
+ */
+function checkReplay<T>(
+  desc: EffectDescription,
+  resolve: Resolve<EffectionResult<T>>,
+  routine: CoroutineView,
+  ctx: DurableContext,
+): ReplayResult<T> {
+  const entry = ctx.replayIndex.peekYield(ctx.coroutineId);
+
+  // ── REPLAY PATH ──
+  // Use a labeled block so that divergence decisions of type "run-live"
+  // can break out to fall through to the live execution path.
+  replay: {
+    if (entry) {
+      // §6.2: Validate description match
+      if (
+        entry.description.type !== desc.type ||
+        entry.description.name !== desc.name
+      ) {
+        // Delegate divergence policy to the Divergence API.
+        const cursor = ctx.replayIndex.getCursor(ctx.coroutineId);
+        const decision = Divergence.invoke(
+          routine.scope,
+          "decide",
+          [{
+            kind: "description-mismatch",
+            coroutineId: ctx.coroutineId,
+            cursor,
+            expected: entry.description,
+            actual: desc,
+          }],
+        );
+
+        if (decision.type === "throw") {
+          resolve({ ok: false, error: decision.error });
+          return { path: "replayed", teardown: (exit) => exit(VOID_OK) };
+        }
+
+        // decision.type === "run-live"
+        ctx.replayIndex.disableReplay(ctx.coroutineId);
+        break replay;
+      }
+
+      // Description matches — now check replay guards before replaying.
+      // ── REPLAY GUARD: Decide phase ──
+      const yieldEvent: Yield = {
+        type: "yield",
+        coroutineId: ctx.coroutineId,
+        description: entry.description,
+        result: entry.result,
+      };
+      const outcome = ReplayGuard.invoke(
+        routine.scope,
+        "decide",
+        [yieldEvent],
+      );
+
+      if (outcome.outcome === "error") {
+        ctx.replayIndex.consumeYield(ctx.coroutineId);
+        const error = outcome.error ?? new StaleInputError(
+          `Stale input detected for ${desc.type}("${desc.name}")`,
+          { coroutineId: ctx.coroutineId, description: desc },
+        );
+        resolve({ ok: false, error });
+        return { path: "replayed", teardown: (exit) => exit(VOID_OK) };
+      }
+
+      // All guards approved — consume the entry and advance cursor
+      ctx.replayIndex.consumeYield(ctx.coroutineId);
+
+      // Feed stored result synchronously
+      resolve(protocolToEffection<T>(entry.result));
+      return { path: "replayed", teardown: (exit) => exit(VOID_OK) };
+    }
+
+    // No replay entry. Check for continue-past-close divergence (§6.3).
+    if (ctx.replayIndex.hasClose(ctx.coroutineId)) {
+      const yieldCount = ctx.replayIndex.yieldCount(ctx.coroutineId);
+      const decision = Divergence.invoke(
+        routine.scope,
+        "decide",
+        [{
+          kind: "continue-past-close",
+          coroutineId: ctx.coroutineId,
+          yieldCount,
+        }],
+      );
+
+      if (decision.type === "throw") {
+        resolve({ ok: false, error: decision.error });
+        return { path: "replayed", teardown: (exit) => exit(VOID_OK) };
+      }
+
+      // decision.type === "run-live"
+      ctx.replayIndex.disableReplay(ctx.coroutineId);
+      break replay;
+    }
+  } // end replay block
+
+  return { path: "live" };
+}
+
+// ---------------------------------------------------------------------------
+// createDurableEffect — callback-based (Executor pattern)
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a DurableEffect using a callback-based executor.
+ *
+ * Use this for timer-like and callback-based APIs (durableSleep, durableAction)
+ * where the resolve/reject/teardown pattern is natural.
+ *
+ * For Operation-based effects, prefer createDurableOperation.
  *
  * @param desc Structured description for the journal and divergence detection
  * @param execute Called only during live execution (skipped during replay)
- * @param _options Reserved for future options
  */
 export function createDurableEffect<T>(
   desc: EffectDescription,
@@ -64,112 +203,10 @@ export function createDurableEffect<T>(
       routine,
     ): (resolve: Resolve<EffectionResult<void>>) => void {
       const ctx = routine.scope.expect<DurableContext>(DurableCtx);
-      const entry = ctx.replayIndex.peekYield(ctx.coroutineId);
-
-      // ── REPLAY PATH ──
-      // Use a labeled block so that divergence decisions of type "run-live"
-      // can break out to fall through to the live execution path.
-      replay: {
-        if (entry) {
-          // §6.2: Validate description match
-          if (
-            entry.description.type !== desc.type ||
-            entry.description.name !== desc.name
-          ) {
-            // Delegate divergence policy to the Divergence API.
-            // Api.invoke() runs the middleware chain synchronously.
-            const cursor = ctx.replayIndex.getCursor(ctx.coroutineId);
-            const decision = Divergence.invoke(
-              routine.scope,
-              "decide",
-              [{
-                kind: "description-mismatch",
-                coroutineId: ctx.coroutineId,
-                cursor,
-                expected: entry.description,
-                actual: desc,
-              }],
-            );
-
-            if (decision.type === "throw") {
-              resolve({ ok: false, error: decision.error });
-              return (exit) => exit(VOID_OK);
-            }
-
-            // decision.type === "run-live"
-            // Disable replay for this coroutine and fall through to live path.
-            ctx.replayIndex.disableReplay(ctx.coroutineId);
-            break replay;
-          }
-
-          // Description matches — now check replay guards before replaying.
-          // ── REPLAY GUARD: Decide phase ──
-          // Runs synchronously, after identity matching but before feeding
-          // the stored result. Middleware returns an outcome based on
-          // observations gathered during the check phase.
-          // See replay-guard-spec.md §5.6.
-          const yieldEvent: Yield = {
-            type: "yield",
-            coroutineId: ctx.coroutineId,
-            description: entry.description,
-            result: entry.result,
-          };
-          const outcome = ReplayGuard.invoke(
-            routine.scope,
-            "decide",
-            [yieldEvent],
-          );
-
-          if (outcome.outcome === "error") {
-            // Guard detected staleness — fail with error
-            ctx.replayIndex.consumeYield(ctx.coroutineId);
-            const error = outcome.error ?? new StaleInputError(
-              `Stale input detected for ${desc.type}("${desc.name}")`,
-              { coroutineId: ctx.coroutineId, description: desc },
-            );
-            resolve({ ok: false, error });
-            return (exit) => exit(VOID_OK);
-          }
-
-          // All guards approved — consume the entry and advance cursor
-          ctx.replayIndex.consumeYield(ctx.coroutineId);
-
-          // Feed stored result synchronously — no I/O, no side effects.
-          // Convert from protocol Result to Effection Result.
-          resolve(protocolToEffection<T>(entry.result));
-          return (exit) => exit(VOID_OK);
-        }
-
-        // No replay entry. Check for continue-past-close divergence (§6.3).
-        // If the journal has a Close for this coroutine but no more yields,
-        // the generator has diverged by continuing to yield effects.
-        if (ctx.replayIndex.hasClose(ctx.coroutineId)) {
-          const yieldCount = ctx.replayIndex.yieldCount(ctx.coroutineId);
-          const decision = Divergence.invoke(
-            routine.scope,
-            "decide",
-            [{
-              kind: "continue-past-close",
-              coroutineId: ctx.coroutineId,
-              yieldCount,
-            }],
-          );
-
-          if (decision.type === "throw") {
-            resolve({ ok: false, error: decision.error });
-            return (exit) => exit(VOID_OK);
-          }
-
-          // decision.type === "run-live"
-          ctx.replayIndex.disableReplay(ctx.coroutineId);
-          break replay;
-        }
-      } // end replay block
+      const replay = checkReplay<T>(desc, resolve, routine, ctx);
+      if (replay.path === "replayed") return replay.teardown;
 
       // ── LIVE PATH ──
-      // Reached either because:
-      // 1. No replay entry and no Close (normal live execution)
-      // 2. Divergence API returned "run-live" (replay disabled)
 
       /** Persist a Yield event then resume the generator. */
       function persistAndResolve(result: Result): void {
@@ -179,11 +216,6 @@ export function createDurableEffect<T>(
           description: desc,
           result,
         };
-        // Strategy B: buffered write with deferred resume.
-        // The generator does not advance until the durable write completes.
-        // If append fails, deliver the error through Effection's normal
-        // error channel to avoid hanging the generator.
-        //
         // Uses scope.run() to call the Operation-returning stream.append()
         // from inside the callback-based enter(). The append runs as a
         // structured operation in the routine's scope — if the scope tears
@@ -201,9 +233,7 @@ export function createDurableEffect<T>(
         });
       }
 
-      // Guard against synchronous throws from the executor. If execute()
-      // throws before returning a teardown function, we need to persist the
-      // error and resolve through the normal channel.
+      // Guard against synchronous throws from the executor.
       let teardown: () => void;
       try {
         teardown = execute(
@@ -234,6 +264,78 @@ export function createDurableEffect<T>(
           exit({ ok: false, error });
         }
       };
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// createDurableOperation — Operation-based (structured concurrency)
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a DurableEffect from an Operation-returning function.
+ *
+ * The live path runs entirely as a generator inside scope.run():
+ * execute the Operation, capture the result, persist the Yield event,
+ * then resolve the generator. No callbacks, no .then(), full structured
+ * concurrency — if the scope tears down, the operation is cancelled.
+ *
+ * Use this for durableCall and any effect where the work is expressed
+ * as an Operation (or can be wrapped as one via Effection's call()).
+ *
+ * @param desc Structured description for the journal and divergence detection
+ * @param execute Returns an Operation to run during live execution
+ */
+export function createDurableOperation<T extends Json>(
+  desc: EffectDescription,
+  execute: () => Operation<T>,
+): DurableEffect<T> {
+  return {
+    description: `${desc.type}(${desc.name})`,
+    effectDescription: desc,
+
+    enter(
+      resolve: Resolve<EffectionResult<T>>,
+      routine,
+    ): (resolve: Resolve<EffectionResult<void>>) => void {
+      const ctx = routine.scope.expect<DurableContext>(DurableCtx);
+      const replay = checkReplay<T>(desc, resolve, routine, ctx);
+      if (replay.path === "replayed") return replay.teardown;
+
+      // ── LIVE PATH ──
+      // Run the entire execute → capture → persist → resolve sequence
+      // as a structured operation in the routine's scope.
+      routine.scope.run(function* () {
+        let result: Result;
+        try {
+          const value = yield* execute();
+          result = { status: "ok", value: value as Json };
+        } catch (e) {
+          const error = e instanceof Error ? e : new Error(String(e));
+          result = { status: "err", error: serializeError(error) };
+        }
+
+        const event: Yield = {
+          type: "yield",
+          coroutineId: ctx.coroutineId,
+          description: desc,
+          result,
+        };
+
+        try {
+          yield* ctx.stream.append(event);
+          resolve(protocolToEffection<T>(result));
+        } catch (err) {
+          resolve({
+            ok: false,
+            error: err instanceof Error ? err : new Error(String(err)),
+          });
+        }
+      });
+
+      // No teardown needed — scope.run() ties the operation's lifecycle
+      // to the routine's scope. Cancellation is handled by Effection.
+      return (exit) => exit(VOID_OK);
     },
   };
 }

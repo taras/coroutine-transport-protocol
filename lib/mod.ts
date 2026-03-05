@@ -70,9 +70,9 @@ export {
   serializeError,
 } from "./serialize.ts";
 
-// Core effect factory
-export { createDurableEffect } from "./effect.ts";
-export type { DurableEffectOptions, Executor } from "./effect.ts";
+// Core effect factories
+export { createDurableEffect, createDurableOperation } from "./effect.ts";
+export type { Executor } from "./effect.ts";
 
 // Workflow-enabled effects
 export {
