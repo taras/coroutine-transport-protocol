@@ -45,15 +45,6 @@ export type Executor = (
 ) => () => void;
 
 /**
- * Options for createDurableEffect.
- */
-export interface DurableEffectOptions {
-  // Reserved for future options. The `meta` field was removed in favor of
-  // open EffectDescription (extra fields beyond `type` and `name`) and
-  // rich result values. See DEC-032.
-}
-
-/**
  * Creates a DurableEffect that handles replay/live dispatch internally.
  *
  * @param desc Structured description for the journal and divergence detection
@@ -63,7 +54,6 @@ export interface DurableEffectOptions {
 export function createDurableEffect<T>(
   desc: EffectDescription,
   execute: Executor,
-  _options?: DurableEffectOptions,
 ): DurableEffect<T> {
   return {
     description: `${desc.type}(${desc.name})`,
