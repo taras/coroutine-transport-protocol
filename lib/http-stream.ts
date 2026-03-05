@@ -5,10 +5,22 @@
  * execution requires synchronous acknowledgment on every write
  * (persist-before-resume). See DEC-026.
  *
- * Concurrent appends are serialized via a promise chain to guarantee
- * server-side sequence ordering. See DEC-027.
+ * Concurrent appends are serialized via a Queue + spawned worker so that
+ * the server always receives them in sequence order. The worker lives
+ * inside a resource scope and is cancelled when the stream is no longer
+ * in use. See DEC-033 (supersedes DEC-027's Promise chain approach).
+ *
+ * The stream is created as an Effection resource via useHttpDurableStream().
  */
 
+import {
+  call,
+  createQueue,
+  resource,
+  spawn,
+  withResolvers,
+} from "@effection/effection";
+import type { Operation, Queue } from "@effection/effection";
 import type { DurableStream } from "./stream.ts";
 import type { DurableEvent } from "./types.ts";
 import {
@@ -24,7 +36,7 @@ import {
 } from "@durable-streams/client";
 
 /**
- * Configuration for HttpDurableStream.
+ * Configuration for useHttpDurableStream.
  */
 export interface HttpDurableStreamOptions {
   /** Base URL of the Durable Streams server (e.g. "http://localhost:4437"). */
@@ -40,224 +52,232 @@ export interface HttpDurableStreamOptions {
 }
 
 /**
- * DurableStream implementation backed by HTTP calls to a Durable Streams server.
- *
- * Guarantees:
- * - Append-only, prefix-closed, monotonic indexing (server-enforced)
- * - Durability: append() resolves only after HTTP 200 (persist-before-resume)
- * - Concurrent appends serialized via promise chain (DEC-027)
- * - Fatal errors (stale epoch) cause all future appends to fail-fast
- * - Stream-Next-Offset tracked from every response (DEC-029)
+ * Extended DurableStream with HTTP-specific observable state.
  */
-export class HttpDurableStream implements DurableStream {
-  private readonly streamUrl: string;
-  private readonly producerId: string;
-  private readonly epoch: number;
-  private readonly _fetch: typeof globalThis.fetch;
-
-  /** Next sequence number to assign. Incremented synchronously on each append(). */
-  private nextSeq = 0;
-
-  /** Serialization chain for concurrent appends. See DEC-027. */
-  private pending: Promise<void> = Promise.resolve();
-
-  /** Set on fatal errors (e.g. StaleEpochError). Future appends fail-fast. */
-  private fatalError: Error | undefined;
-
+export interface HttpDurableStreamHandle extends DurableStream {
   /**
    * Last Stream-Next-Offset received from the server.
    * Tracked from both reads and writes (DEC-029).
    * This is the resumption point for future tail() calls.
    */
   lastOffset: string | undefined;
+}
 
-  private constructor(opts: HttpDurableStreamOptions) {
-    this.streamUrl = `${opts.baseUrl}/${opts.streamId}`;
-    this.producerId = opts.producerId;
-    this.epoch = opts.epoch;
-    this._fetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
-  }
+/** Request sent to the serial append worker. */
+interface AppendRequest {
+  event: DurableEvent;
+  seq: number;
+  resolve: (value: void) => void;
+  reject: (error: Error) => void;
+}
 
-  /**
-   * Create an HttpDurableStream, ensuring the server-side stream exists.
-   *
-   * Sends PUT to create the stream. 201 = created, 200 = already exists.
-   */
-  static async connect(
-    opts: HttpDurableStreamOptions,
-  ): Promise<HttpDurableStream> {
-    const instance = new HttpDurableStream(opts);
-
-    // Create the stream on the server (idempotent — 200 means it exists)
+/**
+ * Create an HTTP-backed DurableStream as an Effection resource.
+ *
+ * The resource:
+ * 1. Creates the stream on the server (idempotent PUT)
+ * 2. Spawns a serial worker that processes appends in FIFO order
+ * 3. Returns a DurableStream handle with Operation-native readAll/append
+ *
+ * The worker is cancelled when the resource scope is torn down.
+ *
+ * Usage:
+ *   yield* useHttpDurableStream({ baseUrl, streamId, producerId, epoch })
+ */
+export function useHttpDurableStream(
+  opts: HttpDurableStreamOptions,
+): Operation<HttpDurableStreamHandle> {
+  return resource(function* (provide) {
+    const streamUrl = `${opts.baseUrl}/${opts.streamId}`;
+    const producerId = opts.producerId;
+    const epoch = opts.epoch;
     const fetchFn = opts.fetch ?? globalThis.fetch.bind(globalThis);
-    const res = await fetchFn(instance.streamUrl, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-    });
-    // Consume the body to free the connection
-    await res.text();
 
-    // 201 = created, 200 = already exists (idempotent)
-    if (res.status !== 201 && res.status !== 200) {
-      throw new Error(
-        `Failed to create stream: HTTP ${res.status}`,
-      );
-    }
-
-    return instance;
-  }
-
-  /**
-   * Read all events in the stream, in append order.
-   *
-   * Uses the stream() function from @durable-streams/client with
-   * offset="-1" (start of stream) and live=false (no tailing).
-   *
-   * Response shape (verified against @durable-streams/client@0.2.1):
-   * - `res.json()` returns a parsed JSON array of events (the server
-   *   sends Content-Type: application/json with a JSON array body,
-   *   and the client's StreamResponseImpl.json() parses it)
-   * - `res.offset` is a getter on StreamResponseImpl that returns
-   *   the Stream-Next-Offset header value as a string
-   */
-  async readAll(): Promise<DurableEvent[]> {
-    const res = await stream({
-      url: this.streamUrl,
-      offset: "-1",
-      live: false,
-      fetch: this._fetch,
-    });
-    const events = await res.json() as DurableEvent[];
-    // Track offset from read (DEC-029)
-    if (res.offset) {
-      this.lastOffset = res.offset;
-    }
-    return events;
-  }
-
-  /**
-   * Append an event to the stream.
-   *
-   * Sequence numbers are assigned synchronously to preserve ordering.
-   * HTTP calls are serialized behind a promise chain so the server
-   * always receives them in sequence order (DEC-027).
-   *
-   * The returned promise resolves only after the server confirms
-   * persistence (persist-before-resume).
-   */
-  append(event: DurableEvent): Promise<void> {
-    // Fail-fast if a fatal error has been set
-    if (this.fatalError) {
-      return Promise.reject(this.fatalError);
-    }
-
-    // Assign seq synchronously — ordering is locked in before any async work
-    const seq = this.nextSeq++;
-
-    // Chain behind pending — ensures HTTP calls arrive in seq order
-    const p = this.pending.then(() => this.doAppend(event, seq));
-
-    // Update the chain. catch(() => {}) prevents a failed append from
-    // blocking subsequent appends, but the error still propagates to
-    // the original caller via `p`.
-    this.pending = p.catch(() => {});
-
-    return p;
-  }
-
-  /**
-   * Execute a single HTTP append with the given event and sequence number.
-   *
-   * Any uncertain write outcome (network error, unexpected HTTP status,
-   * sequence gap) is treated as fatal — `fatalError` is set so all future
-   * appends fail-fast. This prevents sequence drift where later appends
-   * would hit 409 SequenceGapError because an earlier seq was never
-   * acknowledged.
-   */
-  private async doAppend(event: DurableEvent, seq: number): Promise<void> {
-    // Double-check fatal error (may have been set by a preceding append in the chain)
-    if (this.fatalError) {
-      throw this.fatalError;
-    }
-
-    let res: Response;
-    try {
-      res = await this._fetch(this.streamUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          [PRODUCER_ID_HEADER]: this.producerId,
-          [PRODUCER_EPOCH_HEADER]: String(this.epoch),
-          [PRODUCER_SEQ_HEADER]: String(seq),
-        },
-        body: JSON.stringify(event),
+    // ── One-time setup: create the stream on the server ──
+    yield* call(async () => {
+      const res = await fetchFn(streamUrl, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
       });
-    } catch (err) {
-      // Network failure — fatal, sequence state is now uncertain
-      const error = err instanceof Error
-        ? err
-        : new Error(String(err));
-      this.fatalError = error;
-      throw error;
+      await res.text(); // consume body to free connection
+      if (res.status !== 201 && res.status !== 200) {
+        throw new Error(`Failed to create stream: HTTP ${res.status}`);
+      }
+    });
+
+    // ── Mutable state owned by the resource scope ──
+    let nextSeq = 0;
+    let fatalError: Error | undefined;
+    let lastOffset: string | undefined;
+
+    // ── Append worker queue ──
+    const queue: Queue<AppendRequest, void> = createQueue<AppendRequest, void>();
+
+    // ── Spawn the serial append worker ──
+    // Processes one append at a time in FIFO order. Each HTTP POST
+    // completes before the next one starts, guaranteeing server-side
+    // sequence ordering. Fatal errors (stale epoch, network failure)
+    // are propagated to the specific caller and stored for fail-fast.
+    yield* spawn(function* () {
+      let item = yield* queue.next();
+      while (!item.done) {
+        const { event, seq, resolve, reject } = item.value;
+        try {
+          yield* call(() => doAppend(event, seq));
+          resolve(undefined);
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+        item = yield* queue.next();
+      }
+    });
+
+    /**
+     * Execute a single HTTP append with the given event and sequence number.
+     *
+     * Any uncertain write outcome (network error, unexpected HTTP status,
+     * sequence gap) is treated as fatal — `fatalError` is set so all future
+     * appends fail-fast.
+     */
+    async function doAppend(event: DurableEvent, seq: number): Promise<void> {
+      // Double-check fatal error (may have been set by a preceding append)
+      if (fatalError) {
+        throw fatalError;
+      }
+
+      let res: Response;
+      try {
+        res = await fetchFn(streamUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [PRODUCER_ID_HEADER]: producerId,
+            [PRODUCER_EPOCH_HEADER]: String(epoch),
+            [PRODUCER_SEQ_HEADER]: String(seq),
+          },
+          body: JSON.stringify(event),
+        });
+      } catch (err) {
+        // Network failure — fatal, sequence state is now uncertain
+        const error = err instanceof Error ? err : new Error(String(err));
+        fatalError = error;
+        throw error;
+      }
+
+      // Always consume the body to free the connection
+      await res.text();
+
+      switch (res.status) {
+        case 200: {
+          // Success — capture offset
+          const offset = res.headers.get(STREAM_OFFSET_HEADER);
+          if (offset) {
+            lastOffset = offset;
+          }
+          return;
+        }
+        case 204: {
+          // Duplicate (idempotent success) — capture offset if present
+          const offset = res.headers.get(STREAM_OFFSET_HEADER);
+          if (offset) {
+            lastOffset = offset;
+          }
+          return;
+        }
+        case 403: {
+          // Stale epoch — fatal error
+          const currentEpoch = Number(
+            res.headers.get(PRODUCER_EPOCH_HEADER) ?? 0,
+          );
+          const error = new StaleEpochError(currentEpoch);
+          fatalError = error;
+          throw error;
+        }
+        case 409: {
+          // Sequence gap — fatal (should never happen due to serialization,
+          // but if it does, sequence state is irrecoverably desynchronized)
+          const expected = Number(
+            res.headers.get(PRODUCER_EXPECTED_SEQ_HEADER) ?? 0,
+          );
+          const received = Number(
+            res.headers.get(PRODUCER_RECEIVED_SEQ_HEADER) ?? 0,
+          );
+          const error = new SequenceGapError(expected, received);
+          fatalError = error;
+          throw error;
+        }
+        default: {
+          // Unexpected status — fatal, write outcome is uncertain.
+          // TODO: Transient errors (500, 503) could be retried with the
+          // same seq in a future version. See DEC-026 rationale.
+          const error = new Error(
+            `Unexpected append response: HTTP ${res.status}`,
+          );
+          fatalError = error;
+          throw error;
+        }
+      }
     }
 
-    // Always consume the body to free the connection
-    await res.text();
+    // ── Provide the DurableStream handle ──
+    yield* provide({
+      get lastOffset() {
+        return lastOffset;
+      },
 
-    switch (res.status) {
-      case 200: {
-        // Success — capture offset
-        const offset = res.headers.get(STREAM_OFFSET_HEADER);
-        if (offset) {
-          this.lastOffset = offset;
+      /**
+       * Read all events in the stream, in append order.
+       *
+       * Uses the stream() function from @durable-streams/client with
+       * offset="-1" (start of stream) and live=false (no tailing).
+       */
+      *readAll(): Operation<DurableEvent[]> {
+        return yield* call(async () => {
+          const res = await stream({
+            url: streamUrl,
+            offset: "-1",
+            live: false,
+            fetch: fetchFn,
+          });
+          const events = (await res.json()) as DurableEvent[];
+          // Track offset from read (DEC-029)
+          if (res.offset) {
+            lastOffset = res.offset;
+          }
+          return events;
+        });
+      },
+
+      /**
+       * Append an event to the stream.
+       *
+       * Sequence numbers are assigned synchronously when the generator is
+       * started. The actual HTTP call is dispatched to the serial worker
+       * via the queue. The caller suspends until the worker completes the
+       * POST and signals via withResolvers.
+       *
+       * Fatal errors (stale epoch, network failure) are stored and cause
+       * all future appends to fail-fast without enqueuing.
+       */
+      *append(event: DurableEvent): Operation<void> {
+        // Fail-fast if a fatal error has been set
+        if (fatalError) {
+          throw fatalError;
         }
-        return;
-      }
-      case 204: {
-        // Duplicate (idempotent success) — capture offset if present
-        const offset = res.headers.get(STREAM_OFFSET_HEADER);
-        if (offset) {
-          this.lastOffset = offset;
-        }
-        return;
-      }
-      case 403: {
-        // Stale epoch — fatal error
-        const currentEpoch = Number(
-          res.headers.get(PRODUCER_EPOCH_HEADER) ?? 0,
-        );
-        const error = new StaleEpochError(currentEpoch);
-        this.fatalError = error;
-        throw error;
-      }
-      case 409: {
-        // Sequence gap — fatal (should never happen due to serialization,
-        // but if it does, sequence state is irrecoverably desynchronized)
-        const expected = Number(
-          res.headers.get(PRODUCER_EXPECTED_SEQ_HEADER) ?? 0,
-        );
-        const received = Number(
-          res.headers.get(PRODUCER_RECEIVED_SEQ_HEADER) ?? 0,
-        );
-        const error = new SequenceGapError(expected, received);
-        this.fatalError = error;
-        throw error;
-      }
-      default: {
-        // Unexpected status — fatal, write outcome is uncertain.
-        // TODO: Transient errors (500, 503) could be retried with the
-        // same seq in a future version. Currently treated as fatal because
-        // we can't know whether the server persisted the event — if it
-        // did, the next seq succeeds; if not, the next seq hits a 409 gap.
-        // Retry-with-same-seq logic would make transient errors recoverable,
-        // but that requires backoff, max-retry limits, and idempotency
-        // awareness that are out of scope for the initial adapter.
-        const error = new Error(
-          `Unexpected append response: HTTP ${res.status}`,
-        );
-        this.fatalError = error;
-        throw error;
-      }
-    }
-  }
+
+        // Assign seq synchronously — ordering is locked in before any
+        // async work, even when multiple coroutines call append concurrently
+        const seq = nextSeq++;
+
+        // Create a resolver so we can wait for this specific append to complete
+        const { operation, resolve, reject } = withResolvers<void>();
+
+        // Enqueue the request — the worker will process it in FIFO order
+        queue.add({ event, seq, resolve, reject });
+
+        // Suspend until the worker finishes the HTTP POST for this item
+        yield* operation;
+      },
+    });
+  });
 }

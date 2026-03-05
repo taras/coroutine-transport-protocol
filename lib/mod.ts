@@ -32,8 +32,11 @@ export type { DurableStream } from "./stream.ts";
 export { InMemoryStream } from "./stream.ts";
 
 // HTTP-backed stream adapter
-export { HttpDurableStream } from "./http-stream.ts";
-export type { HttpDurableStreamOptions } from "./http-stream.ts";
+export { useHttpDurableStream } from "./http-stream.ts";
+export type {
+  HttpDurableStreamHandle,
+  HttpDurableStreamOptions,
+} from "./http-stream.ts";
 
 // Errors
 export {

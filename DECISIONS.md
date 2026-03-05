@@ -706,5 +706,57 @@ Updated before completion of every phase and committed at the end of each phase.
 - **Consequences:** The Yield event type loses the `meta` field. Effect
   implementations that need staleness validation must return rich result
   objects that include validation data (e.g., content hash alongside content).
-  The protocol remains a two-field `{ type, name }` identity check with
+   The protocol remains a two-field `{ type, name }` identity check with
   open-ended storage for additional context.
+
+## DEC-033: Operation-native HttpDurableStream via resource + Queue + worker
+
+- **Date:** 2026-03-04
+- **Context:** The DurableStream interface was made Operation-native (methods
+  return `Operation<T>` instead of `Promise<T>`) as part of the
+  operation-native-stream branch. HttpDurableStream still used Promise-based
+  methods with a Promise chain for serializing concurrent appends (DEC-027).
+  Simply wrapping the Promise chain with `yield* call()` would work but leaves
+  Promise-based serialization hidden inside an Operation-native interface —
+  not truly structured concurrency.
+- **Options considered:**
+  1. Wrap existing Promise chain with `yield* call()` — minimal change, but
+     the serialization is still Promise-based under the hood
+  2. Channel + spawned worker inside an Effection resource — fully
+     Operation-native, clean cancellation, structured lifecycle
+  3. Hybrid: Queue with deferred/signal per append
+- **Decision:** Option 2. Replace the `HttpDurableStream` class with a
+  `useHttpDurableStream(opts)` resource function that returns
+  `Operation<HttpDurableStreamHandle>`. The resource:
+  1. Creates the stream on the server (PUT) via `yield* call()`
+  2. Creates a `Queue<AppendRequest>` for serializing appends
+  3. Spawns a serial worker that pulls requests from the queue and
+     executes HTTP POSTs one at a time via `yield* call()`
+  4. Uses `withResolvers<void>()` per append so each caller waits for
+     their specific HTTP POST to complete
+  5. Provides the `DurableStream` handle with `readAll()` and `append()`
+     as generator methods
+- **Rationale:** The Queue + worker pattern is idiomatic Effection. The worker's
+  lifetime is bound to the resource scope — when the scope is torn down (e.g.,
+  workflow finishes), the worker is cancelled and no HTTP requests are left
+  dangling. Sequence numbers are still assigned synchronously in `append()`
+  (before the `yield*`), preserving FIFO ordering. The fail-fast pattern is
+  preserved: `fatalError` is checked before enqueuing, and the worker also
+  checks it before each POST. `withResolvers()` bridges the worker's
+  completion back to the specific caller, so errors from a particular append
+  are propagated to the correct caller.
+- **Key primitives used:**
+  - `resource()` — owns the worker scope and provides the stream handle
+  - `createQueue()` — FIFO buffer between concurrent callers and the serial worker
+  - `spawn()` — launches the worker inside the resource scope
+  - `withResolvers()` — per-append completion signaling
+  - `call()` — bridges async fetch/HTTP operations into Operations
+- **Supersedes:** DEC-027's Promise chain serialization. The FIFO ordering
+  guarantee and fail-fast semantics are preserved, but the mechanism is now
+  fully Operation-native.
+- **Consequences:** `HttpDurableStream.connect(opts)` is replaced by
+  `yield* useHttpDurableStream(opts)`. The stream must be created inside an
+  Effection scope. This is natural since it's always used with `durableRun`
+  which requires a scope. Tests and demos updated to wrap stream creation
+  inside `run()`. The `HttpDurableStreamHandle` interface extends
+  `DurableStream` with the `lastOffset` property for offset tracking.

@@ -11,7 +11,7 @@
  * new events, then live execution resumes seamlessly from the next step.
  */
 
-import { HttpDurableStream } from "../lib/http-stream.ts";
+import { useHttpDurableStream } from "../lib/http-stream.ts";
 import {
   durableAll,
   durableCall,
@@ -21,6 +21,7 @@ import {
   type Json,
   type Workflow,
 } from "../lib/mod.ts";
+import { run } from "@effection/effection";
 import type { Operation } from "@effection/effection";
 
 // ---------------------------------------------------------------------------
@@ -163,21 +164,23 @@ console.log(`  Producer:   ${PRODUCER_ID}`);
 console.log();
 
 try {
-  const stream = await HttpDurableStream.connect({
-    baseUrl: SERVER_URL,
-    streamId: STREAM_ID,
-    producerId: PRODUCER_ID,
-    epoch: 1,
+  const result = await run(function* () {
+    const stream = yield* useHttpDurableStream({
+      baseUrl: SERVER_URL,
+      streamId: STREAM_ID,
+      producerId: PRODUCER_ID,
+      epoch: 1,
+    });
+
+    const existing = yield* stream.readAll();
+    if (existing.length > 0) {
+      log("🔄", `Found ${existing.length} events in journal — replaying...`);
+    } else {
+      log("✨", "Fresh start — no events in journal");
+    }
+
+    return yield* durableRun(cookDinner, { stream });
   });
-
-  const existing = await stream.readAll();
-  if (existing.length > 0) {
-    log("🔄", `Found ${existing.length} events in journal — replaying...`);
-  } else {
-    log("✨", "Fresh start — no events in journal");
-  }
-
-  const result = await durableRun(cookDinner, { stream });
 
   console.log();
   console.log(`  ✅ ${result}`);

@@ -1,12 +1,20 @@
 /**
- * Tests for HttpDurableStream — HTTP-backed DurableStream adapter.
+ * Tests for useHttpDurableStream — HTTP-backed DurableStream resource.
  *
  * Uses DurableStreamTestServer from @durable-streams/server for
  * real HTTP round-trips against an in-process server.
+ *
+ * Each test gets its own server instance (random port) managed as an
+ * Effection resource — started before the test body and stopped
+ * automatically when the scope is torn down.
+ *
+ * All stream operations are Operation-native — tests run inside
+ * Effection scopes via run().
  */
 
-import { assertEquals, assertRejects } from "@std/assert";
-import { run } from "@effection/effection";
+import { assertEquals, assertInstanceOf } from "@std/assert";
+import { call, resource, run, scoped } from "@effection/effection";
+import type { Operation } from "@effection/effection";
 import { DurableStreamTestServer } from "@durable-streams/server";
 import { StaleEpochError } from "@durable-streams/client";
 import {
@@ -16,37 +24,33 @@ import {
   type Json,
   type Workflow,
 } from "../lib/mod.ts";
-import { HttpDurableStream } from "../lib/http-stream.ts";
+import { useHttpDurableStream } from "../lib/http-stream.ts";
 
 // ---------------------------------------------------------------------------
-// Shared test server — started once, reused across tests
+// Helpers
 // ---------------------------------------------------------------------------
 
-const server = new DurableStreamTestServer();
-let baseUrl: string;
-
-// Unique stream counter to avoid collisions between tests
+/** Unique stream counter to avoid collisions between tests. */
 let streamCounter = 0;
 function uniqueStreamId(): string {
   return `test-stream-${++streamCounter}-${Date.now()}`;
 }
 
-// Start server before all tests, stop after
-// Deno runs tests in file order; beforeAll/afterAll is simulated
-// by relying on the first test waiting for setup.
-const serverReady = (async () => {
-  await server.start();
-  baseUrl = server.url;
-})();
-
-// Register a cleanup handler
-addEventListener("unload", () => {
-  server.stop();
-});
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+/**
+ * Test server resource — starts a DurableStreamTestServer on a random port
+ * and stops it when the scope is torn down.
+ */
+function useTestServer(): Operation<string> {
+  return resource(function* (provide) {
+    const server = new DurableStreamTestServer({ port: 0 });
+    yield* call(() => server.start());
+    try {
+      yield* provide(server.url);
+    } finally {
+      server.stop();
+    }
+  });
+}
 
 /** Track which functions were actually called during live execution. */
 function createCallTracker() {
@@ -67,44 +71,46 @@ function createCallTracker() {
 // ---------------------------------------------------------------------------
 
 Deno.test("http: append + readAll round-trip", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
-  const stream = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
-  });
+  await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
+    const stream = yield* useHttpDurableStream({
+      baseUrl,
+      streamId,
+      producerId: "p1",
+      epoch: 1,
+    });
 
-  // Append 3 events
-  await stream.append({
-    type: "yield",
-    coroutineId: "root",
-    description: { type: "call", name: "stepA" },
-    result: { status: "ok", value: "alpha" },
-  });
-  await stream.append({
-    type: "yield",
-    coroutineId: "root",
-    description: { type: "call", name: "stepB" },
-    result: { status: "ok", value: "beta" },
-  });
-  await stream.append({
-    type: "close",
-    coroutineId: "root",
-    result: { status: "ok", value: "alpha-beta" },
-  });
+    // Append 3 events
+    yield* stream.append({
+      type: "yield",
+      coroutineId: "root",
+      description: { type: "call", name: "stepA" },
+      result: { status: "ok", value: "alpha" },
+    });
+    yield* stream.append({
+      type: "yield",
+      coroutineId: "root",
+      description: { type: "call", name: "stepB" },
+      result: { status: "ok", value: "beta" },
+    });
+    yield* stream.append({
+      type: "close",
+      coroutineId: "root",
+      result: { status: "ok", value: "alpha-beta" },
+    });
 
-  // Read all events
-  const events = await stream.readAll();
-  assertEquals(events.length, 3);
-  assertEquals(events[0]!.type, "yield");
-  assertEquals(events[0]!.coroutineId, "root");
-  assertEquals(events[1]!.type, "yield");
-  assertEquals(events[2]!.type, "close");
-  if (events[2]!.type === "close") {
-    assertEquals(events[2]!.result, { status: "ok", value: "alpha-beta" });
-  }
+    // Read all events
+    const events = yield* stream.readAll();
+    assertEquals(events.length, 3);
+    assertEquals(events[0]!.type, "yield");
+    assertEquals(events[0]!.coroutineId, "root");
+    assertEquals(events[1]!.type, "yield");
+    assertEquals(events[2]!.type, "close");
+    if (events[2]!.type === "close") {
+      assertEquals(events[2]!.result, { status: "ok", value: "alpha-beta" });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -112,17 +118,18 @@ Deno.test("http: append + readAll round-trip", async () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("http: empty stream readAll returns []", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
-  const stream = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
+  await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
+    const stream = yield* useHttpDurableStream({
+      baseUrl,
+      streamId,
+      producerId: "p1",
+      epoch: 1,
+    });
+    const events = yield* stream.readAll();
+    assertEquals(events, []);
   });
-
-  const events = await stream.readAll();
-  assertEquals(events, []);
 });
 
 // ---------------------------------------------------------------------------
@@ -130,39 +137,43 @@ Deno.test("http: empty stream readAll returns []", async () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("http: idempotent retry — duplicate append succeeds", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
+  await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
 
-  // Create two stream instances with same producer identity
-  const stream1 = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
+    const event = {
+      type: "yield" as const,
+      coroutineId: "root" as const,
+      description: { type: "call", name: "stepA" },
+      result: { status: "ok" as const, value: "alpha" },
+    };
+
+    // Session 1: first append — 200
+    yield* scoped(function* () {
+      const stream1 = yield* useHttpDurableStream({
+        baseUrl,
+        streamId,
+        producerId: "p1",
+        epoch: 1,
+      });
+      yield* stream1.append(event);
+    });
+
+    // Session 2: same producer identity, same seq — 204 (idempotent)
+    yield* scoped(function* () {
+      const stream2 = yield* useHttpDurableStream({
+        baseUrl,
+        streamId,
+        producerId: "p1",
+        epoch: 1,
+      });
+      yield* stream2.append(event);
+
+      // Only one event in the stream
+      const events = yield* stream2.readAll();
+      assertEquals(events.length, 1);
+    });
   });
-  const stream2 = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
-  });
-
-  const event = {
-    type: "yield" as const,
-    coroutineId: "root" as const,
-    description: { type: "call", name: "stepA" },
-    result: { status: "ok" as const, value: "alpha" },
-  };
-
-  // First append — 200
-  await stream1.append(event);
-
-  // Second append with same seq — 204 (idempotent)
-  await stream2.append(event);
-
-  // Only one event in the stream
-  const events = await stream1.readAll();
-  assertEquals(events.length, 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -170,54 +181,64 @@ Deno.test("http: idempotent retry — duplicate append succeeds", async () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("http: epoch fencing — stale epoch rejects and fail-fast", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
+  await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
 
-  // First producer with epoch 2
-  const stream1 = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 2,
-  });
-  await stream1.append({
-    type: "yield",
-    coroutineId: "root",
-    description: { type: "call", name: "stepA" },
-    result: { status: "ok", value: "alpha" },
-  });
-
-  // Second producer with stale epoch 1 (same producerId)
-  const stream2 = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
-  });
-
-  // Should reject with StaleEpochError
-  await assertRejects(
-    () =>
-      stream2.append({
+    // Session 1: producer with epoch 2
+    yield* scoped(function* () {
+      const stream1 = yield* useHttpDurableStream({
+        baseUrl,
+        streamId,
+        producerId: "p1",
+        epoch: 2,
+      });
+      yield* stream1.append({
         type: "yield",
         coroutineId: "root",
-        description: { type: "call", name: "stepB" },
-        result: { status: "ok", value: "beta" },
-      }),
-    StaleEpochError,
-  );
+        description: { type: "call", name: "stepA" },
+        result: { status: "ok", value: "alpha" },
+      });
+    });
 
-  // Future appends should also fail-fast (without making HTTP call)
-  await assertRejects(
-    () =>
-      stream2.append({
-        type: "yield",
-        coroutineId: "root",
-        description: { type: "call", name: "stepC" },
-        result: { status: "ok", value: "gamma" },
-      }),
-    StaleEpochError,
-  );
+    // Session 2: stale epoch 1 (same producerId)
+    yield* scoped(function* () {
+      const stream2 = yield* useHttpDurableStream({
+        baseUrl,
+        streamId,
+        producerId: "p1",
+        epoch: 1,
+      });
+
+      // Should throw StaleEpochError
+      let caughtFirst: Error | undefined;
+      try {
+        yield* stream2.append({
+          type: "yield",
+          coroutineId: "root",
+          description: { type: "call", name: "stepB" },
+          result: { status: "ok", value: "beta" },
+        });
+      } catch (e) {
+        caughtFirst = e as Error;
+      }
+      assertInstanceOf(caughtFirst, StaleEpochError);
+
+      // Future appends should also fail-fast (without making HTTP call)
+      let caughtSecond: Error | undefined;
+      try {
+        yield* stream2.append({
+          type: "yield",
+          coroutineId: "root",
+          description: { type: "call", name: "stepC" },
+          result: { status: "ok", value: "gamma" },
+        });
+      } catch (e) {
+        caughtSecond = e as Error;
+      }
+      assertInstanceOf(caughtSecond, StaleEpochError);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -225,34 +246,38 @@ Deno.test("http: epoch fencing — stale epoch rejects and fail-fast", async () 
 // ---------------------------------------------------------------------------
 
 Deno.test("http: durableRun golden run — full workflow against HTTP", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
   const tracker = createCallTracker();
 
-  const stream = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
+  const result = await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
+    const stream = yield* useHttpDurableStream({
+      baseUrl,
+      streamId,
+      producerId: "p1",
+      epoch: 1,
+    });
+
+    function* workflow(): Workflow<string> {
+      const a = yield* durableCall("stepA", tracker.fn("stepA", "alpha"));
+      const b = yield* durableCall("stepB", tracker.fn("stepB", "beta"));
+      return `${a}-${b}`;
+    }
+
+    const r = yield* durableRun(workflow, { stream });
+
+    // Verify events persisted in HTTP stream
+    const events = yield* stream.readAll();
+    assertEquals(events.length, 3); // 2 Yield + 1 Close
+    assertEquals(events[0]!.type, "yield");
+    assertEquals(events[1]!.type, "yield");
+    assertEquals(events[2]!.type, "close");
+
+    return r;
   });
-
-  function* workflow(): Workflow<string> {
-    const a = yield* durableCall("stepA", tracker.fn("stepA", "alpha"));
-    const b = yield* durableCall("stepB", tracker.fn("stepB", "beta"));
-    return `${a}-${b}`;
-  }
-
-  const result = await run(() => durableRun(workflow, { stream }));
 
   assertEquals(result, "alpha-beta");
   assertEquals(tracker.calls, ["stepA", "stepB"]);
-
-  // Verify events persisted in HTTP stream
-  const events = await stream.readAll();
-  assertEquals(events.length, 3); // 2 Yield + 1 Close
-  assertEquals(events[0]!.type, "yield");
-  assertEquals(events[1]!.type, "yield");
-  assertEquals(events[2]!.type, "close");
 });
 
 // ---------------------------------------------------------------------------
@@ -260,44 +285,53 @@ Deno.test("http: durableRun golden run — full workflow against HTTP", async ()
 // ---------------------------------------------------------------------------
 
 Deno.test("http: durableRun replay — no re-execution from HTTP stream", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
   const tracker1 = createCallTracker();
-
-  // First run — golden (using epoch 1)
-  const stream1 = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
-  });
-
-  function* workflow(): Workflow<string> {
-    const a = yield* durableCall("stepA", tracker1.fn("stepA", "alpha"));
-    const b = yield* durableCall("stepB", tracker1.fn("stepB", "beta"));
-    return `${a}-${b}`;
-  }
-
-  await run(() => durableRun(workflow, { stream: stream1 }));
-  assertEquals(tracker1.calls, ["stepA", "stepB"]);
-
-  // Second run — replay with a fresh stream instance reading the same data
-  // Uses epoch 2 so producer doesn't conflict
   const tracker2 = createCallTracker();
-  const stream2 = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 2,
+
+  const result = await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
+
+    // Session 1 — golden run (epoch 1)
+    yield* scoped(function* () {
+      const stream1 = yield* useHttpDurableStream({
+        baseUrl,
+        streamId,
+        producerId: "p1",
+        epoch: 1,
+      });
+
+      function* workflow(): Workflow<string> {
+        const a = yield* durableCall("stepA", tracker1.fn("stepA", "alpha"));
+        const b = yield* durableCall("stepB", tracker1.fn("stepB", "beta"));
+        return `${a}-${b}`;
+      }
+
+      yield* durableRun(workflow, { stream: stream1 });
+    });
+    assertEquals(tracker1.calls, ["stepA", "stepB"]);
+
+    // Session 2 — replay with a fresh stream instance reading the same data
+    // Uses epoch 2 so producer doesn't conflict
+    const r = yield* scoped(function* () {
+      const stream2 = yield* useHttpDurableStream({
+        baseUrl,
+        streamId,
+        producerId: "p1",
+        epoch: 2,
+      });
+
+      function* workflow2(): Workflow<string> {
+        const a = yield* durableCall("stepA", tracker2.fn("stepA", "alpha"));
+        const b = yield* durableCall("stepB", tracker2.fn("stepB", "beta"));
+        return `${a}-${b}`;
+      }
+
+      return yield* durableRun(workflow2, { stream: stream2 });
+    });
+
+    return r;
   });
-
-  function* workflow2(): Workflow<string> {
-    const a = yield* durableCall("stepA", tracker2.fn("stepA", "alpha"));
-    const b = yield* durableCall("stepB", tracker2.fn("stepB", "beta"));
-    return `${a}-${b}`;
-  }
-
-  const result = await run(() => durableRun(workflow2, { stream: stream2 }));
 
   // Should return same result without re-executing
   assertEquals(result, "alpha-beta");
@@ -309,44 +343,48 @@ Deno.test("http: durableRun replay — no re-execution from HTTP stream", async 
 // ---------------------------------------------------------------------------
 
 Deno.test("http: concurrent appends via durableAll — correct ordering", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
   const tracker = createCallTracker();
 
-  const stream = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
-  });
+  const result = await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
+    const stream = yield* useHttpDurableStream({
+      baseUrl,
+      streamId,
+      producerId: "p1",
+      epoch: 1,
+    });
 
-  const result = await run(() => durableRun(
-    function* () {
-      const results = yield* durableAll([
-        function* () {
-          return yield* durableCall("fetchA", tracker.fn("fetchA", "alpha"));
-        },
-        function* () {
-          return yield* durableCall("fetchB", tracker.fn("fetchB", "beta"));
-        },
-        function* () {
-          return yield* durableCall("fetchC", tracker.fn("fetchC", "gamma"));
-        },
-      ]);
-      return results.join("-");
-    },
-    { stream },
-  ));
+    const r = yield* durableRun(
+      function* () {
+        const results = yield* durableAll([
+          function* () {
+            return yield* durableCall("fetchA", tracker.fn("fetchA", "alpha"));
+          },
+          function* () {
+            return yield* durableCall("fetchB", tracker.fn("fetchB", "beta"));
+          },
+          function* () {
+            return yield* durableCall("fetchC", tracker.fn("fetchC", "gamma"));
+          },
+        ]);
+        return results.join("-");
+      },
+      { stream },
+    );
+
+    // Verify events are in the stream
+    const events = yield* stream.readAll();
+    // 3 child Yield + 3 child Close + 1 root Close = 7
+    assertEquals(events.length, 7);
+
+    return r;
+  });
 
   assertEquals(result, "alpha-beta-gamma");
 
   // Verify all effects were called
   assertEquals(tracker.calls.length, 3);
-
-  // Verify events are in the stream
-  const events = await stream.readAll();
-  // 3 child Yield + 3 child Close + 1 root Close = 7
-  assertEquals(events.length, 7);
 });
 
 // ---------------------------------------------------------------------------
@@ -354,41 +392,48 @@ Deno.test("http: concurrent appends via durableAll — correct ordering", async 
 // ---------------------------------------------------------------------------
 
 Deno.test("http: network error propagation — fetch failure rejects append", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
-
   // Use a custom fetch that fails on POST (append) but succeeds on PUT (create)
+  // and GET (readAll)
   let callCount = 0;
   // deno-lint-ignore no-explicit-any
   const failingFetch = (input: any, init: any) => {
     if (init?.method === "PUT") {
       return globalThis.fetch(input, init);
     }
-    callCount++;
-    return Promise.reject(new Error("Network failure"));
+    if (init?.method === "POST") {
+      callCount++;
+      return Promise.reject(new Error("Network failure"));
+    }
+    // GET for readAll
+    return globalThis.fetch(input, init);
   };
 
-  const stream = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
-    fetch: failingFetch,
-  });
+  await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
+    const stream = yield* useHttpDurableStream({
+      baseUrl,
+      streamId,
+      producerId: "p1",
+      epoch: 1,
+      fetch: failingFetch,
+    });
 
-  await assertRejects(
-    () =>
-      stream.append({
+    let caught: Error | undefined;
+    try {
+      yield* stream.append({
         type: "yield",
         coroutineId: "root",
         description: { type: "call", name: "stepA" },
         result: { status: "ok", value: "alpha" },
-      }),
-    Error,
-    "Network failure",
-  );
+      });
+    } catch (e) {
+      caught = e as Error;
+    }
 
-  assertEquals(callCount, 1);
+    assertEquals(caught?.message, "Network failure");
+    assertEquals(callCount, 1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -396,58 +441,60 @@ Deno.test("http: network error propagation — fetch failure rejects append", as
 // ---------------------------------------------------------------------------
 
 Deno.test("http: lastOffset tracked from readAll and append", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
-  const stream = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
+  await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
+    const stream = yield* useHttpDurableStream({
+      baseUrl,
+      streamId,
+      producerId: "p1",
+      epoch: 1,
+    });
+
+    // Initially undefined
+    assertEquals(stream.lastOffset, undefined);
+
+    // After readAll on empty stream — offset should be set (to start position)
+    yield* stream.readAll();
+    // The server returns an offset even for empty streams
+    // (it's the "current end of stream" position)
+    const offsetAfterEmptyRead = stream.lastOffset;
+
+    // After append — offset should update
+    yield* stream.append({
+      type: "yield",
+      coroutineId: "root",
+      description: { type: "call", name: "stepA" },
+      result: { status: "ok", value: "alpha" },
+    });
+    const offsetAfterAppend = stream.lastOffset;
+    assertEquals(typeof offsetAfterAppend, "string");
+
+    // After readAll — offset should be at least as far as append
+    yield* stream.readAll();
+    const offsetAfterRead = stream.lastOffset;
+    assertEquals(typeof offsetAfterRead, "string");
+
+    // Offsets should be non-empty hex strings
+    if (offsetAfterAppend) {
+      assertEquals(offsetAfterAppend.includes("_"), true);
+    }
+    if (offsetAfterRead) {
+      assertEquals(offsetAfterRead.includes("_"), true);
+    }
+
+    // The read offset should equal or exceed the append offset
+    // (they're lexicographically comparable hex strings)
+    if (offsetAfterAppend && offsetAfterRead) {
+      assertEquals(offsetAfterRead >= offsetAfterAppend, true);
+    }
+
+    // Empty read might not have an offset (depends on server implementation)
+    // so we just verify that after data exists, offsets are tracked
+    if (offsetAfterEmptyRead) {
+      assertEquals(typeof offsetAfterEmptyRead, "string");
+    }
   });
-
-  // Initially undefined
-  assertEquals(stream.lastOffset, undefined);
-
-  // After readAll on empty stream — offset should be set (to start position)
-  await stream.readAll();
-  // The server returns an offset even for empty streams
-  // (it's the "current end of stream" position)
-  const offsetAfterEmptyRead = stream.lastOffset;
-
-  // After append — offset should update
-  await stream.append({
-    type: "yield",
-    coroutineId: "root",
-    description: { type: "call", name: "stepA" },
-    result: { status: "ok", value: "alpha" },
-  });
-  const offsetAfterAppend = stream.lastOffset;
-  assertEquals(typeof offsetAfterAppend, "string");
-
-  // After readAll — offset should be at least as far as append
-  await stream.readAll();
-  const offsetAfterRead = stream.lastOffset;
-  assertEquals(typeof offsetAfterRead, "string");
-
-  // Offsets should be non-empty hex strings
-  if (offsetAfterAppend) {
-    assertEquals(offsetAfterAppend.includes("_"), true);
-  }
-  if (offsetAfterRead) {
-    assertEquals(offsetAfterRead.includes("_"), true);
-  }
-
-  // The read offset should equal or exceed the append offset
-  // (they're lexicographically comparable hex strings)
-  if (offsetAfterAppend && offsetAfterRead) {
-    assertEquals(offsetAfterRead >= offsetAfterAppend, true);
-  }
-
-  // Empty read might not have an offset (depends on server implementation)
-  // so we just verify that after data exists, offsets are tracked
-  if (offsetAfterEmptyRead) {
-    assertEquals(typeof offsetAfterEmptyRead, "string");
-  }
 });
 
 // ---------------------------------------------------------------------------
@@ -455,59 +502,65 @@ Deno.test("http: lastOffset tracked from readAll and append", async () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("http: append failure makes subsequent appends fail-fast", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
-
   let postCount = 0;
   // deno-lint-ignore no-explicit-any
   const flakyFetch = (input: any, init: any) => {
     if (init?.method === "PUT") {
       return globalThis.fetch(input, init);
     }
-    postCount++;
-    // First POST fails with network error
-    return Promise.reject(new Error("Connection reset"));
+    if (init?.method === "POST") {
+      postCount++;
+      // First POST fails with network error
+      return Promise.reject(new Error("Connection reset"));
+    }
+    // GET for readAll
+    return globalThis.fetch(input, init);
   };
 
-  const stream = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
-    fetch: flakyFetch,
-  });
+  await run(function* () {
+    const baseUrl = yield* useTestServer();
+    const streamId = uniqueStreamId();
+    const stream = yield* useHttpDurableStream({
+      baseUrl,
+      streamId,
+      producerId: "p1",
+      epoch: 1,
+      fetch: flakyFetch,
+    });
 
-  // First append — fails with network error
-  await assertRejects(
-    () =>
-      stream.append({
+    // First append — fails with network error
+    let caughtFirst: Error | undefined;
+    try {
+      yield* stream.append({
         type: "yield",
         coroutineId: "root",
         description: { type: "call", name: "stepA" },
         result: { status: "ok", value: "alpha" },
-      }),
-    Error,
-    "Connection reset",
-  );
+      });
+    } catch (e) {
+      caughtFirst = e as Error;
+    }
+    assertEquals(caughtFirst?.message, "Connection reset");
+    assertEquals(postCount, 1);
 
-  assertEquals(postCount, 1);
-
-  // Second append — should fail-fast with the same fatal error,
-  // without making another HTTP call
-  await assertRejects(
-    () =>
-      stream.append({
+    // Second append — should fail-fast with the same fatal error,
+    // without making another HTTP call
+    let caughtSecond: Error | undefined;
+    try {
+      yield* stream.append({
         type: "yield",
         coroutineId: "root",
         description: { type: "call", name: "stepB" },
         result: { status: "ok", value: "beta" },
-      }),
-    Error,
-    "Connection reset",
-  );
+      });
+    } catch (e) {
+      caughtSecond = e as Error;
+    }
+    assertEquals(caughtSecond?.message, "Connection reset");
 
-  // No additional HTTP calls were made
-  assertEquals(postCount, 1);
+    // No additional HTTP calls were made
+    assertEquals(postCount, 1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -515,9 +568,6 @@ Deno.test("http: append failure makes subsequent appends fail-fast", async () =>
 // ---------------------------------------------------------------------------
 
 Deno.test("http: durableRun preserves original error when close append fails", async () => {
-  await serverReady;
-  const streamId = uniqueStreamId();
-
   let postCount = 0;
   // deno-lint-ignore no-explicit-any
   const failAfterTwoFetch = (input: any, init: any) => {
@@ -536,29 +586,32 @@ Deno.test("http: durableRun preserves original error when close append fails", a
     return globalThis.fetch(input, init);
   };
 
-  const stream = await HttpDurableStream.connect({
-    baseUrl,
-    streamId,
-    producerId: "p1",
-    epoch: 1,
-    fetch: failAfterTwoFetch,
-  });
+  let caught: Error | undefined;
+  try {
+    await run(function* () {
+      const baseUrl = yield* useTestServer();
+      const streamId = uniqueStreamId();
+      const stream = yield* useHttpDurableStream({
+        baseUrl,
+        streamId,
+        producerId: "p1",
+        epoch: 1,
+        fetch: failAfterTwoFetch,
+      });
 
-  // Workflow that throws after its effects complete
-  const err = await assertRejects(
-    () =>
-      run(() => durableRun(
+      yield* durableRun(
         function* (): Workflow<string> {
           yield* durableCall("stepA", () => Promise.resolve("alpha"));
           throw new Error("Workflow kaboom");
         },
         { stream },
-      )),
-    Error,
-    "Workflow kaboom",
-  );
+      );
+    });
+  } catch (e) {
+    caught = e as Error;
+  }
 
   // The original workflow error is preserved, not replaced by
   // "Stream write failed" from the Close(err) append
-  assertEquals((err as Error).message, "Workflow kaboom");
+  assertEquals(caught?.message, "Workflow kaboom");
 });
