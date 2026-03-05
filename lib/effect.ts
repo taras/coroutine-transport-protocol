@@ -181,16 +181,24 @@ export function createDurableEffect<T>(
         };
         // Strategy B: buffered write with deferred resume.
         // The generator does not advance until the durable write completes.
-        // If append rejects, deliver the error through Effection's normal
+        // If append fails, deliver the error through Effection's normal
         // error channel to avoid hanging the generator.
-        ctx.stream.append(event).then(
-          () => resolve(protocolToEffection<T>(result)),
-          (err) =>
+        //
+        // Uses scope.run() to call the Operation-returning stream.append()
+        // from inside the callback-based enter(). The append runs as a
+        // structured operation in the routine's scope — if the scope tears
+        // down, the append is cancelled.
+        routine.scope.run(function* () {
+          try {
+            yield* ctx.stream.append(event);
+            resolve(protocolToEffection<T>(result));
+          } catch (err) {
             resolve({
               ok: false,
               error: err instanceof Error ? err : new Error(String(err)),
-            }),
-        );
+            });
+          }
+        });
       }
 
       // Guard against synchronous throws from the executor. If execute()
